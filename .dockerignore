@@ -1,0 +1,14 @@
+weights/
+outputs/
+tmp/
+__pycache__/
+.git/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+*.log
+.DS_Store

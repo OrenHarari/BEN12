@@ -1,0 +1,17 @@
+weights/
+outputs/
+tmp/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+*.egg
+.DS_Store
+*.log
+.ipynb_checkpoints/
