@@ -83,6 +83,24 @@ class KenBurnsEffect:
         cropped = frame[y1:y2, x1:x2]
         return cv2.resize(cropped, (self.W, self.H), interpolation=cv2.INTER_LANCZOS4)
 
+    def apply_single(
+        self,
+        frame: np.ndarray,
+        frame_index: int,
+        total_frames: int,
+        zoom_start: float = 1.0,
+        zoom_end: float = 1.08,
+        pan_x_end: float = 0.02,
+        pan_y_end: float = 0.01,
+    ) -> np.ndarray:
+        """Apply Ken Burns to a single frame based on its position in the sequence."""
+        t = frame_index / max(total_frames - 1, 1)
+        t_e = self._ease_in_out_cubic(t)
+        zoom = zoom_start + (zoom_end - zoom_start) * t_e
+        px = pan_x_end * t_e
+        py = pan_y_end * t_e
+        return self.apply(frame, zoom, px, py)
+
     def apply_sequence(
         self,
         frames: list[np.ndarray],

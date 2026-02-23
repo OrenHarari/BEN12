@@ -37,11 +37,15 @@ class TriangleWarper:
         dst_tri: np.ndarray,   # [3, 2] float32
     ) -> None:
         """Affine-warp one triangle from src_img into dst_buf in-place."""
-        r_dst = cv2.boundingRect(dst_tri.reshape(1, 3, 2))
-        r_src = cv2.boundingRect(src_tri.reshape(1, 3, 2))
+        # Ensure proper data types and shape
+        src_tri = np.asarray(src_tri, dtype=np.float32).reshape(3, 2)
+        dst_tri = np.asarray(dst_tri, dtype=np.float32).reshape(3, 2)
+        
+        r_dst = cv2.boundingRect(dst_tri.astype(np.int32))
+        r_src = cv2.boundingRect(src_tri.astype(np.int32))
 
-        dst_tri_local = dst_tri - [r_dst[0], r_dst[1]]
-        src_tri_local = src_tri - [r_src[0], r_src[1]]
+        dst_tri_local = dst_tri - np.array([r_dst[0], r_dst[1]], dtype=np.float32)
+        src_tri_local = src_tri - np.array([r_src[0], r_src[1]], dtype=np.float32)
 
         # Create triangle mask in dst local space
         mask = np.zeros((r_dst[3], r_dst[2]), dtype=np.float32)
@@ -55,7 +59,8 @@ class TriangleWarper:
         if src_patch.size == 0:
             return
 
-        M = cv2.getAffineTransform(src_tri_local, dst_tri_local)
+        # getAffineTransform requires exactly (3,2) float32 arrays
+        M = cv2.getAffineTransform(src_tri_local.astype(np.float32), dst_tri_local.astype(np.float32))
         warped = cv2.warpAffine(
             src_patch,
             M,

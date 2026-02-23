@@ -9,7 +9,8 @@ import streamlit as st
 
 @dataclass
 class SessionState:
-    uploaded_image: Optional[Image.Image] = None
+    uploaded_images: list[Image.Image] = field(default_factory=list)
+    uploaded_image: Optional[Image.Image] = None  # for backward compatibility
     job_id: Optional[str] = None
     is_processing: bool = False
     progress: float = 0.0

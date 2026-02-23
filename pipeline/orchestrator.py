@@ -226,6 +226,232 @@ class GrowingUpPipeline:
         report(1.00, "Done!")
         return output_path
 
+    def run_multi_image(
+        self,
+        input_images: list[Image.Image],
+        progress_callback: Callable[[float, str], None] | None = None,
+    ) -> Path:
+        """
+        Multi-image pipeline: Creates a video from multiple photos of the same person.
+        Uses FULL original images (not just face crops) with smooth transitions
+        that preserve backgrounds and surroundings.
+        
+        Args:
+            input_images: List of PIL RGB face photos in chronological order
+            progress_callback: fn(progress: float [0,1], message: str)
+
+        Returns:
+            Path to the rendered MP4 file
+        """
+        cfg = self.config
+        vc = cfg.video
+
+        output_path = cfg.output_dir / f"growing_up_{self.job_id}.mp4"
+        frame_dir = cfg.tmp_dir / self.job_id
+        frame_dir.mkdir(parents=True, exist_ok=True)
+
+        def report(p: float, msg: str) -> None:
+            logger.info("[%.0f%%] %s", p * 100, msg)
+            if progress_callback:
+                progress_callback(p, msg)
+
+        out_w, out_h = vc.output_width, vc.output_height
+
+        # ── Stage 1: Resize full images to output resolution ──────────
+        report(0.05, f"Preparing {len(input_images)} full-resolution images…")
+        full_images: list[Image.Image] = []
+        for i, img in enumerate(input_images):
+            # Resize to output resolution while keeping aspect ratio, then pad/crop
+            resized = self._fit_to_canvas(img, out_w, out_h)
+            full_images.append(resized)
+
+        # Store previews from full images
+        self.stage_previews = []
+        for i, img in enumerate(full_images):
+            thumb = img.resize((128, 128), Image.LANCZOS)
+            self.stage_previews.append((i, thumb))
+
+        # ── Stage 2: Face detection & landmark extraction ─────────────
+        report(0.10, "Detecting faces and extracting landmarks…")
+        aligner = FaceAligner(cfg.model.insightface_model)
+        lm_extractor = LandmarkExtractor(aligner)
+        all_landmarks: list[np.ndarray] = []
+        face_detected: list[bool] = []
+
+        for i, img in enumerate(full_images):
+            img_bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            try:
+                lm = lm_extractor.extract_landmarks(img_bgr)
+                all_landmarks.append(lm)
+                face_detected.append(True)
+            except ValueError:
+                logger.warning(f"No face detected in image {i} — using cross-dissolve")
+                all_landmarks.append(np.zeros((68, 2), dtype=np.float32))
+                face_detected.append(False)
+
+        # ── Stage 3: Generate transitions and write frames directly ────
+        report(0.20, "Creating smooth transitions…")
+        morpher = DelaunayMorpher()
+        warper = TriangleWarper()
+        
+        # More frames per transition for a cinematic feel
+        frames_per_transition = max(60, cfg.pipeline.frames_per_transition)
+        # Add hold frames to show each image for a moment
+        hold_frames = 30  # ~0.5 seconds at 60fps
+        
+        # Pre-convert all full images to BGR numpy arrays, then free PIL images
+        full_bgr: list[np.ndarray] = []
+        for img in full_images:
+            full_bgr.append(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR))
+        del full_images
+        _free_memory()
+
+        # Write frames directly to disk to save memory
+        kb = KenBurnsEffect(output_size=(out_w, out_h))
+        writer = FrameWriter(frame_dir)
+        frame_idx = 0
+        n_trans = len(full_bgr) - 1
+        
+        # Calculate total frames for Ken Burns progress
+        total_frames = hold_frames  # first image hold
+        for i in range(n_trans):
+            total_frames += frames_per_transition + hold_frames
+
+        for i in range(n_trans):
+            img_src_bgr = full_bgr[i]
+            img_dst_bgr = full_bgr[i + 1]
+            
+            # Hold on source image for a moment (only for first image)
+            if i == 0:
+                for _ in range(hold_frames):
+                    kb_frame = kb.apply_single(
+                        img_src_bgr, frame_idx, total_frames,
+                        zoom_start=1.0,
+                        zoom_end=vc.ken_burns_zoom_max,
+                        pan_x_end=vc.ken_burns_pan_x,
+                        pan_y_end=vc.ken_burns_pan_y,
+                    )
+                    writer.write_single(kb_frame, frame_idx)
+                    frame_idx += 1
+
+            pts_src = all_landmarks[i]
+            pts_dst = all_landmarks[i + 1]
+            both_have_faces = face_detected[i] and face_detected[i + 1]
+            
+            # Compute triangulation once per transition (not per frame)
+            triangles = None
+            if both_have_faces:
+                triangles = morpher.compute_triangulation(
+                    pts_src, pts_dst, (out_h, out_w)
+                )
+            
+            for f in range(frames_per_transition):
+                alpha = f / max(frames_per_transition - 1, 1)
+                alpha = self._ease_in_out(alpha)
+                
+                if triangles is not None:
+                    frame = warper.morph_frame(
+                        img_src_bgr, img_dst_bgr,
+                        pts_src, pts_dst, triangles, alpha,
+                    )
+                else:
+                    frame = cv2.addWeighted(
+                        img_src_bgr, 1.0 - alpha,
+                        img_dst_bgr, alpha, 0,
+                    )
+                
+                kb_frame = kb.apply_single(
+                    frame, frame_idx, total_frames,
+                    zoom_start=1.0,
+                    zoom_end=vc.ken_burns_zoom_max,
+                    pan_x_end=vc.ken_burns_pan_x,
+                    pan_y_end=vc.ken_burns_pan_y,
+                )
+                writer.write_single(kb_frame, frame_idx)
+                frame_idx += 1
+            
+            # Hold on destination image
+            for _ in range(hold_frames):
+                kb_frame = kb.apply_single(
+                    img_dst_bgr, frame_idx, total_frames,
+                    zoom_start=1.0,
+                    zoom_end=vc.ken_burns_zoom_max,
+                    pan_x_end=vc.ken_burns_pan_x,
+                    pan_y_end=vc.ken_burns_pan_y,
+                )
+                writer.write_single(kb_frame, frame_idx)
+                frame_idx += 1
+            
+            # Free source image if no longer needed
+            if i > 0:
+                full_bgr[i] = None  # type: ignore[assignment]
+                _free_memory()
+
+            p_frac = 0.20 + 0.60 * ((i + 1) / n_trans)
+            report(p_frac, f"Transition {i + 1}/{n_trans}…")
+
+        del full_bgr
+        _free_memory()
+
+        # ── Stage 4: FFmpeg render ────────────────────────────────────
+        report(0.85, "Rendering high-quality 1080p MP4…")
+        renderer = VideoRenderer(cfg)
+        renderer.render(
+            frame_dir=frame_dir,
+            output_path=output_path,
+            fps=vc.fps_output,
+            total_frames=frame_idx,
+            progress_callback=lambda p: report(0.85 + 0.15 * p, "Encoding video…"),
+        )
+
+        report(1.00, "Done!")
+        return output_path
+
+    @staticmethod
+    def _ease_in_out(t: float) -> float:
+        """Cubic ease-in-out for smoother transitions."""
+        if t < 0.5:
+            return 4.0 * t * t * t
+        p = 2.0 * t - 2.0
+        return 0.5 * p * p * p + 1.0
+
+    @staticmethod
+    def _fit_to_canvas(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+        """
+        Resize image to fit target dimensions, preserving aspect ratio.
+        Fills remaining space with blurred version of the image (no black bars).
+        """
+        w, h = img.size
+        target_ratio = target_w / target_h
+        img_ratio = w / h
+
+        if img_ratio > target_ratio:
+            # Image is wider — fit by width
+            new_w = target_w
+            new_h = int(target_w / img_ratio)
+        else:
+            # Image is taller — fit by height
+            new_h = target_h
+            new_w = int(target_h * img_ratio)
+
+        # Create blurred background from the image itself
+        bg = img.resize((target_w, target_h), Image.LANCZOS)
+        bg_np = np.array(bg)
+        bg_blurred = cv2.GaussianBlur(bg_np, (51, 51), 30)
+        # Darken the blurred background slightly
+        bg_blurred = (bg_blurred * 0.4).astype(np.uint8)
+        background = Image.fromarray(bg_blurred)
+
+        # Resize the main image
+        foreground = img.resize((new_w, new_h), Image.LANCZOS)
+
+        # Paste centered on the blurred background
+        x_offset = (target_w - new_w) // 2
+        y_offset = (target_h - new_h) // 2
+        background.paste(foreground, (x_offset, y_offset))
+
+        return background
+
 
 def _free_memory() -> None:
     gc.collect()

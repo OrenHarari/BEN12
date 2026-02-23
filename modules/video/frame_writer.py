@@ -21,3 +21,6 @@ class FrameWriter:
     def write_frame(self, frame: np.ndarray, index: int) -> None:
         path = self.output_dir / f"{index:06d}.png"
         cv2.imwrite(str(path), frame)
+
+    # Alias for convenience
+    write_single = write_frame
