@@ -9,7 +9,7 @@ from typing import Callable
 import cv2
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from app.config import AppConfig
 from modules.face.alignment import FaceAligner
@@ -229,6 +229,9 @@ class GrowingUpPipeline:
     def run_multi_image(
         self,
         input_images: list[Image.Image],
+        captions: list[str] | None = None,
+        fade_in_out: bool = True,
+        music_path: str | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
     ) -> Path:
         """
@@ -294,10 +297,17 @@ class GrowingUpPipeline:
         morpher = DelaunayMorpher()
         warper = TriangleWarper()
         
-        # More frames per transition for a cinematic feel
-        frames_per_transition = max(60, cfg.pipeline.frames_per_transition)
-        # Add hold frames to show each image for a moment
+        # Frames per transition (user-selected speed)
+        frames_per_transition = max(30, cfg.pipeline.frames_per_transition)
+        # Hold frames to show each image for a moment
         hold_frames = 30  # ~0.5 seconds at 60fps
+        
+        # Build caption text for each image
+        cap_list: list[str] = []
+        if captions:
+            cap_list = [c.strip() if c else "" for c in captions]
+        while len(cap_list) < len(input_images):
+            cap_list.append("")
         
         # Pre-convert all full images to BGR numpy arrays, then free PIL images
         full_bgr: list[np.ndarray] = []
@@ -312,33 +322,96 @@ class GrowingUpPipeline:
         frame_idx = 0
         n_trans = len(full_bgr) - 1
         
+        # Fade settings
+        fade_frames = 30 if fade_in_out else 0  # 0.5 sec at 60fps
+        
         # Calculate total frames for Ken Burns progress
         total_frames = hold_frames  # first image hold
         for i in range(n_trans):
             total_frames += frames_per_transition + hold_frames
 
+        def _apply_caption(frame_bgr: np.ndarray, text: str, opacity: float = 1.0) -> np.ndarray:
+            """Overlay text caption at the bottom of the frame."""
+            if not text:
+                return frame_bgr
+            h, w = frame_bgr.shape[:2]
+            # Convert to PIL for text rendering
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(frame_rgb)
+            draw = ImageDraw.Draw(pil_img)
+            
+            font_size = max(24, h // 25)
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+            except (IOError, OSError):
+                font = ImageFont.load_default()
+            
+            # Measure text
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            tx = (w - tw) // 2
+            ty = h - th - max(30, h // 20)
+            
+            # Semi-transparent background bar
+            bar_pad = 12
+            overlay = pil_img.copy()
+            draw_ov = ImageDraw.Draw(overlay)
+            draw_ov.rectangle(
+                [tx - bar_pad, ty - bar_pad, tx + tw + bar_pad, ty + th + bar_pad],
+                fill=(0, 0, 0),
+            )
+            pil_img = Image.blend(pil_img, overlay, alpha=0.5 * opacity)
+            
+            # Draw text
+            draw2 = ImageDraw.Draw(pil_img)
+            text_color = (255, 255, 255, int(255 * opacity))
+            draw2.text((tx, ty), text, font=font, fill=text_color[:3])
+            
+            return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+        def _apply_fade(frame_bgr: np.ndarray, fade_factor: float) -> np.ndarray:
+            """Apply fade: 0.0 = black, 1.0 = fully visible."""
+            if fade_factor >= 1.0:
+                return frame_bgr
+            return (frame_bgr.astype(np.float32) * fade_factor).astype(np.uint8)
+
+        def _write_frame(frame_bgr: np.ndarray, idx: int, caption: str = "") -> int:
+            """Apply KB + caption + fade, write to disk, return next idx."""
+            f = kb.apply_single(
+                frame_bgr, idx, total_frames,
+                zoom_start=1.0,
+                zoom_end=vc.ken_burns_zoom_max,
+                pan_x_end=vc.ken_burns_pan_x,
+                pan_y_end=vc.ken_burns_pan_y,
+            )
+            if caption:
+                f = _apply_caption(f, caption)
+            # Fade in at start
+            if fade_in_out and idx < fade_frames:
+                f = _apply_fade(f, idx / max(fade_frames, 1))
+            # Fade out at end
+            if fade_in_out and idx >= total_frames - fade_frames:
+                remaining = total_frames - 1 - idx
+                f = _apply_fade(f, remaining / max(fade_frames, 1))
+            writer.write_single(f, idx)
+            return idx + 1
+
         for i in range(n_trans):
             img_src_bgr = full_bgr[i]
             img_dst_bgr = full_bgr[i + 1]
+            src_caption = cap_list[i]
+            dst_caption = cap_list[i + 1]
             
             # Hold on source image for a moment (only for first image)
             if i == 0:
                 for _ in range(hold_frames):
-                    kb_frame = kb.apply_single(
-                        img_src_bgr, frame_idx, total_frames,
-                        zoom_start=1.0,
-                        zoom_end=vc.ken_burns_zoom_max,
-                        pan_x_end=vc.ken_burns_pan_x,
-                        pan_y_end=vc.ken_burns_pan_y,
-                    )
-                    writer.write_single(kb_frame, frame_idx)
-                    frame_idx += 1
+                    frame_idx = _write_frame(img_src_bgr, frame_idx, src_caption)
 
             pts_src = all_landmarks[i]
             pts_dst = all_landmarks[i + 1]
             both_have_faces = face_detected[i] and face_detected[i + 1]
             
-            # Compute triangulation once per transition (not per frame)
+            # Compute triangulation once per transition
             triangles = None
             if both_have_faces:
                 triangles = morpher.compute_triangulation(
@@ -360,49 +433,43 @@ class GrowingUpPipeline:
                         img_dst_bgr, alpha, 0,
                     )
                 
-                kb_frame = kb.apply_single(
-                    frame, frame_idx, total_frames,
-                    zoom_start=1.0,
-                    zoom_end=vc.ken_burns_zoom_max,
-                    pan_x_end=vc.ken_burns_pan_x,
-                    pan_y_end=vc.ken_burns_pan_y,
-                )
-                writer.write_single(kb_frame, frame_idx)
-                frame_idx += 1
+                # Cross-fade captions during transition
+                cap = src_caption if alpha < 0.5 else dst_caption
+                frame_idx = _write_frame(frame, frame_idx, cap)
             
             # Hold on destination image
             for _ in range(hold_frames):
-                kb_frame = kb.apply_single(
-                    img_dst_bgr, frame_idx, total_frames,
-                    zoom_start=1.0,
-                    zoom_end=vc.ken_burns_zoom_max,
-                    pan_x_end=vc.ken_burns_pan_x,
-                    pan_y_end=vc.ken_burns_pan_y,
-                )
-                writer.write_single(kb_frame, frame_idx)
-                frame_idx += 1
+                frame_idx = _write_frame(img_dst_bgr, frame_idx, dst_caption)
             
             # Free source image if no longer needed
             if i > 0:
                 full_bgr[i] = None  # type: ignore[assignment]
                 _free_memory()
 
-            p_frac = 0.20 + 0.60 * ((i + 1) / n_trans)
+            p_frac = 0.20 + 0.55 * ((i + 1) / n_trans)
             report(p_frac, f"Transition {i + 1}/{n_trans}…")
 
         del full_bgr
         _free_memory()
 
         # ── Stage 4: FFmpeg render ────────────────────────────────────
-        report(0.85, "Rendering high-quality 1080p MP4…")
+        report(0.80, "Rendering video…")
         renderer = VideoRenderer(cfg)
         renderer.render(
             frame_dir=frame_dir,
             output_path=output_path,
             fps=vc.fps_output,
             total_frames=frame_idx,
-            progress_callback=lambda p: report(0.85 + 0.15 * p, "Encoding video…"),
+            progress_callback=lambda p: report(0.80 + 0.10 * p, "Encoding video…"),
         )
+
+        # ── Stage 5: Add background music if provided ─────────────────
+        if music_path:
+            report(0.92, "Adding background music…")
+            renderer.mux_audio(
+                video_path=output_path,
+                audio_path=Path(music_path),
+            )
 
         report(1.00, "Done!")
         return output_path

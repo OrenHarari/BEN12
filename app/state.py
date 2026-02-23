@@ -18,6 +18,12 @@ class SessionState:
     output_path: Optional[str] = None
     error_message: Optional[str] = None
     preview_frames: list = field(default_factory=list)
+    # New feature settings
+    image_captions: list[str] = field(default_factory=list)
+    transition_speed: str = "normal"  # slow / normal / fast
+    resolution: str = "1080p"  # 720p / 1080p / 4K
+    music_path: Optional[str] = None
+    fade_enabled: bool = True
 
 
 def get_state() -> SessionState:

@@ -62,3 +62,36 @@ class VideoRenderer:
             raise RuntimeError(f"FFmpeg exited with code {process.returncode}")
 
         return output_path
+
+    def mux_audio(
+        self,
+        video_path: Path,
+        audio_path: Path,
+    ) -> Path:
+        """
+        Merge an audio track into the video, trimmed to video length.
+        Overwrites the original video file.
+        """
+        tmp_out = video_path.with_suffix(".tmp.mp4")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-i", str(audio_path),
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+            "-movflags", "+faststart",
+            str(tmp_out),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Audio mux failed: %s", result.stderr[-500:] if result.stderr else "unknown"
+            )
+            tmp_out.unlink(missing_ok=True)
+            return video_path
+
+        # Replace original with muxed version
+        tmp_out.replace(video_path)
+        return video_path
