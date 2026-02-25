@@ -38,9 +38,36 @@ RESOLUTION_MAP = {
 }
 
 SPEED_MAP = {
-    "slow":   90,   # frames per transition
-    "normal": 60,
-    "fast":   30,
+    "slow":   24,   # morph keyframes per transition (RIFE 4× → 96 final)
+    "normal": 16,   # morph keyframes per transition (RIFE 4× → 64 final)
+    "fast":   10,   # morph keyframes per transition (RIFE 4× → 40 final)
+}
+
+PERFORMANCE_PRESETS = {
+    "fast": {
+        "sdxl_steps": 18,
+        "refiner_steps": 0,
+        "rife_multiplier": 1,
+        "ffmpeg_preset": "fast",
+        "enable_gfpgan": False,
+        "enable_refiner": False,
+    },
+    "balanced": {
+        "sdxl_steps": 25,
+        "refiner_steps": 15,
+        "rife_multiplier": 2,
+        "ffmpeg_preset": "medium",
+        "enable_gfpgan": True,
+        "enable_refiner": True,
+    },
+    "quality": {
+        "sdxl_steps": 35,
+        "refiner_steps": 25,
+        "rife_multiplier": 4,
+        "ffmpeg_preset": "slow",
+        "enable_gfpgan": True,
+        "enable_refiner": True,
+    },
 }
 
 
@@ -73,6 +100,17 @@ def _sidebar(state):
         disabled=state.is_processing,
     )
 
+    # Performance preset
+    st.sidebar.divider()
+    st.sidebar.subheader("⚡ Performance")
+    state.performance_mode = st.sidebar.selectbox(
+        "Render Preset",
+        options=["fast", "balanced", "quality"],
+        index=["fast", "balanced", "quality"].index(state.performance_mode),
+        help="Fast = quick preview. Quality = best detail, slower render.",
+        disabled=state.is_processing,
+    )
+
     # Background music upload
     st.sidebar.divider()
     st.sidebar.subheader("🎵 Background Music")
@@ -93,25 +131,31 @@ def _sidebar(state):
         state.music_path = None
 
     st.sidebar.divider()
-    st.sidebar.header("System")
-    device = DeviceManager.get_device()
-    st.sidebar.metric("Device", device.type.upper())
-    if device.type == "cuda":
-        import torch
-        props = torch.cuda.get_device_properties(0)
-        vram_gb = props.total_memory / 1e9
-        st.sidebar.metric("GPU", props.name)
-        st.sidebar.metric("VRAM", f"{vram_gb:.1f} GB")
-    elif device.type == "mps":
-        st.sidebar.info("Apple Silicon (MPS)")
-    else:
-        st.sidebar.warning("No GPU — CPU mode (slower)")
-
-    st.sidebar.divider()
-    st.sidebar.caption(
-        "All processing happens locally.  \n"
-        "No data is sent to any server."
+    show_system = st.sidebar.checkbox(
+        "Show system info",
+        value=False,
+        disabled=state.is_processing,
     )
+    if show_system:
+        st.sidebar.header("System")
+        device = DeviceManager.get_device()
+        st.sidebar.metric("Device", device.type.upper())
+        if device.type == "cuda":
+            import torch
+            props = torch.cuda.get_device_properties(0)
+            vram_gb = props.total_memory / 1e9
+            st.sidebar.metric("GPU", props.name)
+            st.sidebar.metric("VRAM", f"{vram_gb:.1f} GB")
+        elif device.type == "mps":
+            st.sidebar.info("Apple Silicon (MPS)")
+        else:
+            st.sidebar.warning("No GPU — CPU mode (slower)")
+
+        st.sidebar.divider()
+        st.sidebar.caption(
+            "All processing happens locally.  \n"
+            "No data is sent to any server."
+        )
 
 
 def _run_pipeline(images, captions, config, state):
@@ -123,6 +167,14 @@ def _run_pipeline(images, captions, config, state):
         config.video.output_width = w
         config.video.output_height = h
         config.pipeline.frames_per_transition = SPEED_MAP[state.transition_speed]
+
+        preset = PERFORMANCE_PRESETS[state.performance_mode]
+        config.pipeline.sdxl_steps = preset["sdxl_steps"]
+        config.pipeline.sdxl_refiner_steps = preset["refiner_steps"]
+        config.pipeline.enable_refiner = preset["enable_refiner"]
+        config.pipeline.enable_gfpgan = preset["enable_gfpgan"]
+        config.video.rife_multiplier = preset["rife_multiplier"]
+        config.video.preset = preset["ffmpeg_preset"]
 
         pipeline = GrowingUpPipeline(config)
 
@@ -308,14 +360,16 @@ def main():
             steps = [
                 "Face detection & alignment",
                 "Landmark extraction",
-                "Delaunay morphing / cross-dissolve",
+                "Low-res Delaunay morphing (fast)",
+                "RIFE 4× frame interpolation (GPU)",
+                "Upscale to output resolution",
                 "Ken Burns cinematic zoom",
             ]
             if any(c.strip() for c in state.image_captions):
                 steps.append("Text caption overlay")
             if state.fade_enabled:
                 steps.append("Fade in / fade out")
-            steps.append("FFmpeg encoding")
+            steps.append("FFmpeg pipe encoding")
             if state.music_path:
                 steps.append("Add background music")
         else:

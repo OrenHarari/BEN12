@@ -40,10 +40,15 @@ class PipelineConfig:
     frames_per_transition: int = 48
     sdxl_steps: int = 30
     sdxl_guidance: float = 7.5
+    sdxl_refiner_steps: int = 20
+    sdxl_refiner_strength: float = 0.25
+    sdxl_refiner_guidance: float = 5.0
     ip_adapter_scale: float = 0.6
     use_half_precision: bool = True
     face_align_size: int = 512
     identity_sim_threshold: float = 0.20
+    enable_refiner: bool = True
+    enable_gfpgan: bool = True
 
 
 @dataclass

@@ -124,15 +124,19 @@ class AgeProgressionPipeline:
             scale=pc.ip_adapter_scale,
         )
         base_img = images[0]
+        if not pc.enable_refiner:
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+            return base_img
 
         # Light refiner pass to add detail without changing structure
         refined = self._refiner_pipe(
             prompt=positive,
             negative_prompt=negative,
             image=base_img,
-            num_inference_steps=20,
-            strength=0.25,
-            guidance_scale=5.0,
+            num_inference_steps=pc.sdxl_refiner_steps,
+            strength=pc.sdxl_refiner_strength,
+            guidance_scale=pc.sdxl_refiner_guidance,
             generator=generator,
         ).images[0]
 
