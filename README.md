@@ -151,5 +151,10 @@ VideoConfig(
     rife_multiplier=4,           # RIFE interpolation factor (2 or 4)
     ken_burns_zoom_max=1.08,     # max zoom (1.0 = none, 1.08 = 8%)
     crf=18,                      # FFmpeg quality (lower = better)
+    prefer_gpu_encoder=True,     # auto-use h264_nvenc on CUDA when available
 )
 ```
+
+In the Streamlit UI, transition speed is controlled via a numeric slider `1..10`:
+- `1` = slowest transition (most in-between frames)
+- `10` = fastest transition

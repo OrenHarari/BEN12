@@ -1,0 +1,8 @@
+[server]
+# Local desktop usage: avoid upload 403 caused by XSRF/origin mismatches.
+enableXsrfProtection = false
+enableCORS = false
+maxUploadSize = 512
+
+[browser]
+gatherUsageStats = false

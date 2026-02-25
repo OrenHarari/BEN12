@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import logging
+import os
+
+logger = logging.getLogger(__name__)
 
 
 class FaceAligner:
@@ -23,15 +27,40 @@ class FaceAligner:
     )
 
     def __init__(self, model_name: str = "buffalo_l", ctx_id: int = 0):
-        import insightface
         from insightface.app import FaceAnalysis
 
-        self.app = FaceAnalysis(
-            name=model_name,
-            allowed_modules=["detection", "landmark_2d_106"],
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-        )
-        self.app.prepare(ctx_id=ctx_id, det_size=(640, 640))
+        self.app = None
+        provider_mode = os.getenv("BEN12_INSIGHTFACE_PROVIDER", "cpu").strip().lower()
+        if provider_mode == "cuda":
+            providers_try = [
+                ["CUDAExecutionProvider", "CPUExecutionProvider"],
+                ["CPUExecutionProvider"],
+            ]
+        else:
+            providers_try = [["CPUExecutionProvider"]]
+
+        last_exc: Exception | None = None
+        for providers in providers_try:
+            try:
+                app = FaceAnalysis(
+                    name=model_name,
+                    allowed_modules=["detection", "landmark_2d_106"],
+                    providers=providers,
+                )
+                # CPU provider expects ctx_id=-1
+                prep_ctx = ctx_id if "CUDAExecutionProvider" in providers else -1
+                app.prepare(ctx_id=prep_ctx, det_size=(640, 640))
+                self.app = app
+                if providers == ["CPUExecutionProvider"]:
+                    logger.warning(
+                        "InsightFace is running on CPUExecutionProvider."
+                    )
+                break
+            except Exception as exc:
+                last_exc = exc
+
+        if self.app is None:
+            raise RuntimeError("Failed to initialize InsightFace FaceAnalysis.") from last_exc
 
     def align_face(
         self,

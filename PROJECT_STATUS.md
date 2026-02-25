@@ -1,8 +1,35 @@
 # 🎬 AI Growing Up Video Generator - Project Status
 
-**Last Updated:** February 23, 2026  
+**Last Updated:** February 25, 2026  
 **Branch:** `claude/ai-growing-up-video-t1aZ8`  
 **Status:** ✅ **FULLY OPERATIONAL**
+
+---
+
+## ✅ Latest Update (February 25, 2026)
+
+### Implemented now
+
+- Transition control upgraded from `slow/normal/fast` to a numeric slider `1..10`
+- New mapping logic: `1 = slowest` transitions (more frames), `10 = fastest` (fewer frames)
+- Single-image pipeline render now streams frames directly to FFmpeg pipe (removed PNG round-trip)
+- Automatic GPU video encoding selection (`h264_nvenc`) when CUDA is available and FFmpeg supports it
+- Safe fallback to `libx264` when NVENC is unavailable
+- Added tests for:
+  - speed slider to frame-count mapping
+  - FFmpeg encoding argument selection (CPU vs GPU)
+
+### Expected impact
+
+- Faster final video creation (especially by removing PNG disk I/O in single-image mode)
+- Real transition speed control that the user can tune precisely
+- Better utilization of strong CUDA machines for final encode speed
+
+### Next optimization targets
+
+- Add timing logs per stage (morph/interpolation/encode) for objective performance tracking
+- Optional Turbo mode for multi-image flow (adaptive downscale + dynamic RIFE multiplier)
+- Optional high-quality GPU path (NVENC profile tuning + quality presets per resolution)
 
 ---
 

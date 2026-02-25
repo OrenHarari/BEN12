@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 import io
+import subprocess
+import sys
 import tempfile
 import threading
 import time
+from functools import lru_cache
 from pathlib import Path
 
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps
 
-from app.config import get_config
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.config import (
+    compute_transition_plan,
+    get_config,
+    perceptual_duration_options,
+)
 from app.state import get_state, reset_state
 from utils.device import DeviceManager
+from utils.ffmpeg import resolve_ffmpeg_binary
 
 st.set_page_config(
     page_title="AI Growing Up Generator",
@@ -36,12 +48,9 @@ RESOLUTION_MAP = {
     "1080p": (1920, 1080),
     "4K":    (3840, 2160),
 }
-
-SPEED_MAP = {
-    "slow":   24,   # morph keyframes per transition (RIFE 4× → 96 final)
-    "normal": 16,   # morph keyframes per transition (RIFE 4× → 64 final)
-    "fast":   10,   # morph keyframes per transition (RIFE 4× → 40 final)
-}
+MAX_UPLOAD_EDGE = 2048
+TRANSITION_STYLE_OPTIONS = ["Emotional", "Balanced", "Fast"]
+TRANSITION_DURATION_OPTIONS = perceptual_duration_options()
 
 PERFORMANCE_PRESETS = {
     "fast": {
@@ -49,6 +58,7 @@ PERFORMANCE_PRESETS = {
         "refiner_steps": 0,
         "rife_multiplier": 1,
         "ffmpeg_preset": "fast",
+        "ffmpeg_gpu_preset": "p4",
         "enable_gfpgan": False,
         "enable_refiner": False,
     },
@@ -57,6 +67,7 @@ PERFORMANCE_PRESETS = {
         "refiner_steps": 15,
         "rife_multiplier": 2,
         "ffmpeg_preset": "medium",
+        "ffmpeg_gpu_preset": "p5",
         "enable_gfpgan": True,
         "enable_refiner": True,
     },
@@ -65,10 +76,69 @@ PERFORMANCE_PRESETS = {
         "refiner_steps": 25,
         "rife_multiplier": 4,
         "ffmpeg_preset": "slow",
+        "ffmpeg_gpu_preset": "p6",
+        "enable_gfpgan": True,
+        "enable_refiner": True,
+    },
+    "extreme_speed_3090": {
+        "sdxl_steps": 8,
+        "refiner_steps": 0,
+        "rife_multiplier": 1,
+        "ffmpeg_preset": "fast",
+        "ffmpeg_gpu_preset": "p1",
+        "enable_gfpgan": False,
+        "enable_refiner": False,
+    },
+    "extreme_quality_3090": {
+        "sdxl_steps": 24,
+        "refiner_steps": 18,
+        "rife_multiplier": 2,
+        "ffmpeg_preset": "slow",
+        "ffmpeg_gpu_preset": "p5",
         "enable_gfpgan": True,
         "enable_refiner": True,
     },
 }
+PERFORMANCE_PRESET_ORDER = [
+    "fast",
+    "balanced",
+    "quality",
+    "extreme_speed_3090",
+    "extreme_quality_3090",
+]
+
+
+@lru_cache(maxsize=8)
+def _ffmpeg_supports_encoder(encoder_name: str) -> bool:
+    try:
+        res = subprocess.run(
+            [resolve_ffmpeg_binary(), "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return False
+    if res.returncode != 0:
+        return False
+    return encoder_name in (res.stdout + "\n" + res.stderr)
+
+
+def _safe_rerun() -> None:
+    """
+    Support both old and new Streamlit rerun APIs.
+    """
+    if hasattr(st, "rerun"):
+        st.rerun()
+        return
+    if hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
+        return
+    raise RuntimeError("This Streamlit build does not support rerun APIs.")
+
+
+def _nearest_duration_option(value: float) -> float:
+    return min(TRANSITION_DURATION_OPTIONS, key=lambda x: abs(x - float(value)))
 
 
 def _sidebar(state):
@@ -83,12 +153,22 @@ def _sidebar(state):
         disabled=state.is_processing,
     )
 
-    # Transition speed
-    state.transition_speed = st.sidebar.select_slider(
-        "Transition Speed",
-        options=["slow", "normal", "fast"],
-        value=state.transition_speed,
-        help="Slow = longer, smoother transitions. Fast = quicker cuts.",
+    # Transition timing system (style + exact duration)
+    state.transition_style = st.sidebar.selectbox(
+        "Transition Style",
+        options=TRANSITION_STYLE_OPTIONS,
+        index=TRANSITION_STYLE_OPTIONS.index(state.transition_style)
+        if state.transition_style in TRANSITION_STYLE_OPTIONS
+        else 1,
+        help="Emotional=cinematic slow, Balanced=natural, Fast=snappy.",
+        disabled=state.is_processing,
+    )
+    state.transition_duration_seconds = st.sidebar.select_slider(
+        "Transition Duration (seconds)",
+        options=TRANSITION_DURATION_OPTIONS,
+        value=_nearest_duration_option(state.transition_duration_seconds),
+        format_func=lambda x: f"{x:.2f}s",
+        help="Per-transition exact duration (0.2s to 12s).",
         disabled=state.is_processing,
     )
 
@@ -105,10 +185,40 @@ def _sidebar(state):
     st.sidebar.subheader("⚡ Performance")
     state.performance_mode = st.sidebar.selectbox(
         "Render Preset",
-        options=["fast", "balanced", "quality"],
-        index=["fast", "balanced", "quality"].index(state.performance_mode),
+        options=PERFORMANCE_PRESET_ORDER,
+        index=PERFORMANCE_PRESET_ORDER.index(state.performance_mode)
+        if state.performance_mode in PERFORMANCE_PRESET_ORDER
+        else 1,
         help="Fast = quick preview. Quality = best detail, slower render.",
         disabled=state.is_processing,
+    )
+    state.turbo_mode = st.sidebar.checkbox(
+        "Super Turbo (large albums)",
+        value=state.turbo_mode,
+        help="Aggressively reduces morph workload for much faster renders.",
+        disabled=state.is_processing,
+    )
+    state.transition_process_workers = st.sidebar.slider(
+        "Transition Workers (Processes)",
+        min_value=1,
+        max_value=3,
+        value=int(state.transition_process_workers),
+        help="Parallel CPU transition generation. 3 is best for large albums.",
+        disabled=state.is_processing,
+    )
+    state.chunked_parallel = st.sidebar.checkbox(
+        "Chunked Parallel Transitions",
+        value=state.chunked_parallel,
+        help="Generate transition chunks in parallel processes, then stream-encode in order.",
+        disabled=state.is_processing,
+    )
+    state.transition_chunk_size = st.sidebar.slider(
+        "Chunk Size (transitions)",
+        min_value=1,
+        max_value=6,
+        value=int(state.transition_chunk_size),
+        help="How many transitions each process computes per chunk.",
+        disabled=state.is_processing or not state.chunked_parallel,
     )
 
     # Background music upload
@@ -166,15 +276,40 @@ def _run_pipeline(images, captions, config, state):
         w, h = RESOLUTION_MAP[state.resolution]
         config.video.output_width = w
         config.video.output_height = h
-        config.pipeline.frames_per_transition = SPEED_MAP[state.transition_speed]
-
         preset = PERFORMANCE_PRESETS[state.performance_mode]
         config.pipeline.sdxl_steps = preset["sdxl_steps"]
         config.pipeline.sdxl_refiner_steps = preset["refiner_steps"]
         config.pipeline.enable_refiner = preset["enable_refiner"]
         config.pipeline.enable_gfpgan = preset["enable_gfpgan"]
+        config.pipeline.enable_turbo_mode = state.turbo_mode
+        config.pipeline.transition_process_workers = int(state.transition_process_workers)
+        config.pipeline.enable_chunked_parallel = bool(state.chunked_parallel)
+        config.pipeline.transition_chunk_size = int(state.transition_chunk_size)
         config.video.rife_multiplier = preset["rife_multiplier"]
-        config.video.preset = preset["ffmpeg_preset"]
+        config.pipeline.transition_style = state.transition_style
+        config.pipeline.transition_duration_seconds = state.transition_duration_seconds
+        timing = compute_transition_plan(
+            transition_style=state.transition_style,
+            transition_duration_seconds=state.transition_duration_seconds,
+            fps_output=config.video.fps_output,
+            rife_multiplier=config.video.rife_multiplier,
+            num_images=max(2, len(images)),
+            turbo_mode=state.turbo_mode,
+            output_width=config.video.output_width,
+            output_height=config.video.output_height,
+        )
+        config.pipeline.frames_per_transition = int(timing["keyframes_per_transition"])
+        device = DeviceManager.get_device()
+        if (
+            config.video.prefer_gpu_encoder
+            and device.type == "cuda"
+            and _ffmpeg_supports_encoder("h264_nvenc")
+        ):
+            config.video.codec = "h264_nvenc"
+            config.video.preset = preset["ffmpeg_gpu_preset"]
+        else:
+            config.video.codec = "libx264"
+            config.video.preset = preset["ffmpeg_preset"]
 
         pipeline = GrowingUpPipeline(config)
 
@@ -195,6 +330,7 @@ def _run_pipeline(images, captions, config, state):
 
         state.output_path = str(output_path)
         state.preview_frames = pipeline.stage_previews
+        state.stage_timings = getattr(pipeline, "last_stage_timings", {})
     except Exception as exc:
         import traceback
         state.error_message = f"{str(exc)}\n\n{traceback.format_exc()}"
@@ -235,11 +371,19 @@ def main():
             state.uploaded_images = []
             successful_loads = 0
 
-            for idx, uploaded_file in enumerate(uploaded_files[:30]):
+            for idx, uploaded_file in enumerate(uploaded_files[:120]):
                 try:
                     uploaded_file.seek(0)
                     file_bytes = io.BytesIO(uploaded_file.read())
-                    image = Image.open(file_bytes).convert("RGB")
+                    image = ImageOps.exif_transpose(Image.open(file_bytes)).convert("RGB")
+                    w, h = image.size
+                    max_edge = max(w, h)
+                    if max_edge > MAX_UPLOAD_EDGE:
+                        scale = MAX_UPLOAD_EDGE / max_edge
+                        image = image.resize(
+                            (max(1, int(w * scale)), max(1, int(h * scale))),
+                            Image.LANCZOS,
+                        )
                     state.uploaded_images.append(image)
                     successful_loads += 1
                 except (Image.UnidentifiedImageError, IOError) as e:
@@ -323,7 +467,7 @@ def main():
             - Creates cinematic aging video
 
             **Option 2: Multiple Photos (Authentic)**
-            - Upload 2-30 photos in chronological order
+            - Upload 2-120 photos in chronological order
             - Creates smooth transitions between your real photos
             - More authentic and personal result
             """)
@@ -334,10 +478,36 @@ def main():
             st.caption("AI will generate these age stages from your photo")
         else:
             st.subheader(f"Video from {num_images} Photos")
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             c1.metric("Transitions", f"{num_images - 1}")
-            c2.metric("Speed", state.transition_speed.title())
-            st.success(f"✨ Smooth transitions between your {num_images} photos")
+            c2.metric("Style", state.transition_style)
+            c3.metric("Duration", f"{state.transition_duration_seconds:.2f}s")
+            preset = PERFORMANCE_PRESETS[state.performance_mode]
+            profile = compute_transition_plan(
+                transition_style=state.transition_style,
+                transition_duration_seconds=state.transition_duration_seconds,
+                fps_output=config.video.fps_output,
+                rife_multiplier=max(1, int(preset["rife_multiplier"])),
+                turbo_mode=state.turbo_mode,
+                num_images=max(2, num_images),
+                output_width=res_w,
+                output_height=res_h,
+            )
+            transition_frames = int(profile["transition_output_frames"])
+            transition_sec = transition_frames / max(config.video.fps_output, 1)
+            st.caption(
+                f"Estimated transition duration: ~{transition_sec:.2f}s "
+                f"({transition_frames} frames @ {config.video.fps_output}fps)"
+            )
+            if state.turbo_mode:
+                st.caption(
+                    f"Turbo profile: morph {int(profile['morph_w'])}x{int(profile['morph_h'])}, "
+                    f"hold {int(profile['hold_frames'])} frames, "
+                    f"smoothing window {int(profile['smoothing_window'])}, "
+                    f"workers {int(state.transition_process_workers)}, "
+                    f"chunked={'on' if state.chunked_parallel else 'off'}"
+                )
+            st.success(f"Smooth transitions between your {num_images} photos")
 
         st.subheader("Output Spec")
         c1, c2, c3 = st.columns(3)
@@ -400,9 +570,14 @@ def main():
         images_to_process = state.uploaded_images.copy()
         captions_to_process = state.image_captions.copy()
         saved_resolution = state.resolution
-        saved_speed = state.transition_speed
+        saved_style = state.transition_style
+        saved_duration = state.transition_duration_seconds
+        saved_workers = state.transition_process_workers
+        saved_chunked = state.chunked_parallel
+        saved_chunk_size = state.transition_chunk_size
         saved_fade = state.fade_enabled
         saved_music = state.music_path
+        saved_turbo = state.turbo_mode
 
         reset_state()
         state = get_state()
@@ -413,9 +588,14 @@ def main():
         state.uploaded_image = images_to_process[0] if images_to_process else None
         state.image_captions = captions_to_process
         state.resolution = saved_resolution
-        state.transition_speed = saved_speed
+        state.transition_style = saved_style
+        state.transition_duration_seconds = saved_duration
+        state.transition_process_workers = saved_workers
+        state.chunked_parallel = saved_chunked
+        state.transition_chunk_size = saved_chunk_size
         state.fade_enabled = saved_fade
         state.music_path = saved_music
+        state.turbo_mode = saved_turbo
 
         thread = threading.Thread(
             target=_run_pipeline,
@@ -429,7 +609,7 @@ def main():
         st.progress(state.progress)
         st.info(state.status_message)
         time.sleep(2)
-        st.rerun()
+        _safe_rerun()
 
     if state.error_message:
         st.error("Pipeline failed")
@@ -437,6 +617,9 @@ def main():
 
     if state.output_path and not state.is_processing:
         st.success("Video generated successfully!")
+        if state.stage_timings:
+            st.subheader("Stage Timings")
+            st.json({k: round(float(v), 2) for k, v in state.stage_timings.items()})
         st.subheader("Preview")
         st.video(state.output_path)
 

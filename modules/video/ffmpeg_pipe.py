@@ -7,14 +7,34 @@ adding ~100 s and ~7 GB temp disk usage for a 14-image project at 1080p.
 from __future__ import annotations
 
 import logging
-import re
 import subprocess
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 
+from utils.ffmpeg import resolve_ffmpeg_binary
+
 logger = logging.getLogger(__name__)
+
+
+def _video_encode_args(codec: str, preset: str, quality: int) -> list[str]:
+    """
+    Build FFmpeg encode args for CPU (libx264) or NVIDIA NVENC.
+
+    Uses the same quality number (`quality`) as CRF/CQ.
+    """
+    if codec == "h264_nvenc":
+        return [
+            "-c:v", "h264_nvenc",
+            "-preset", preset,
+            "-cq", str(quality),
+            "-b:v", "0",
+        ]
+    return [
+        "-c:v", codec,
+        "-preset", preset,
+        "-crf", str(quality),
+    ]
 
 
 class FFmpegPipeWriter:
@@ -46,6 +66,9 @@ class FFmpegPipeWriter:
         codec: str = "libx264",
         preset: str = "medium",
         pixel_format: str = "yuv420p",
+        scale_width: int | None = None,
+        scale_height: int | None = None,
+        scale_flags: str = "lanczos",
     ):
         self.output_path = Path(output_path)
         self.width = width
@@ -55,6 +78,9 @@ class FFmpegPipeWriter:
         self.codec = codec
         self.preset = preset
         self.pixel_format = pixel_format
+        self.scale_width = scale_width
+        self.scale_height = scale_height
+        self.scale_flags = scale_flags
         self._process: subprocess.Popen | None = None
         self._frame_count = 0
 
@@ -62,20 +88,25 @@ class FFmpegPipeWriter:
         """Start the FFmpeg subprocess with stdin pipe."""
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        ffmpeg_bin = resolve_ffmpeg_binary()
         cmd = [
-            "ffmpeg", "-y",
+            ffmpeg_bin, "-y",
             "-f", "rawvideo",
             "-pix_fmt", "bgr24",
             "-s", f"{self.width}x{self.height}",
             "-r", str(self.fps),
             "-i", "pipe:0",
-            "-c:v", self.codec,
-            "-preset", self.preset,
-            "-crf", str(self.crf),
+            *_video_encode_args(self.codec, self.preset, self.crf),
             "-pix_fmt", self.pixel_format,
-            "-movflags", "+faststart",
-            str(self.output_path),
         ]
+        if self.scale_width and self.scale_height:
+            cmd.extend(
+                [
+                    "-vf",
+                    f"scale={self.scale_width}:{self.scale_height}:flags={self.scale_flags}",
+                ]
+            )
+        cmd.extend(["-movflags", "+faststart", str(self.output_path)])
         logger.info("FFmpeg pipe cmd: %s", " ".join(cmd))
 
         self._process = subprocess.Popen(

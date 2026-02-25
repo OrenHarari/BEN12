@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import uuid
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
+from time import perf_counter
 from typing import Callable
 
 import cv2
@@ -11,7 +14,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
-from app.config import AppConfig
+from app.config import AppConfig, compute_transition_plan
 from modules.face.alignment import FaceAligner
 from modules.face.embedding import IdentityEmbedder
 from modules.face.refinement import FaceRefiner
@@ -20,13 +23,72 @@ from modules.interpolation.rife_inference import RIFEInterpolator
 from modules.morph.landmarks import DelaunayMorpher, LandmarkExtractor
 from modules.morph.warp import TriangleWarper
 from modules.video.ffmpeg_pipe import FFmpegPipeWriter
-from modules.video.frame_writer import FrameWriter
 from modules.video.ken_burns import KenBurnsEffect
 from modules.video.renderer import VideoRenderer
 from utils.device import DeviceManager
 from utils.image_utils import bgr_to_pil, pil_to_bgr
 
 logger = logging.getLogger(__name__)
+
+
+def _generate_transition_keyframes_worker(
+    src: np.ndarray,
+    dst: np.ndarray,
+    pts_src: np.ndarray,
+    pts_dst: np.ndarray,
+    both_have_faces: bool,
+    alpha_schedule: list[float],
+) -> list[np.ndarray]:
+    """
+    Process-safe worker for one transition morph sequence.
+    """
+    if not alpha_schedule:
+        return [src]
+
+    if both_have_faces:
+        morpher = DelaunayMorpher()
+        warper = TriangleWarper()
+        h, w = src.shape[:2]
+        triangles = morpher.compute_triangulation(pts_src, pts_dst, (h, w))
+        pts_all_src, pts_all_dst = warper._build_border_pts(pts_src, pts_dst, h, w)
+        src_f = src.astype(np.float32)
+        dst_f = dst.astype(np.float32)
+        return [
+            warper.morph_frame_precomputed(
+                img_src_f=src_f,
+                img_dst_f=dst_f,
+                pts_all_src=pts_all_src,
+                pts_all_dst=pts_all_dst,
+                triangles=triangles,
+                alpha=float(alpha),
+            )
+            for alpha in alpha_schedule
+        ]
+
+    return [
+        cv2.addWeighted(src, 1.0 - float(alpha), dst, float(alpha), 0)
+        for alpha in alpha_schedule
+    ]
+
+
+def _generate_transition_chunk_worker(
+    tasks: list[tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]],
+    alpha_schedule: list[float],
+) -> dict[int, list[np.ndarray]]:
+    """
+    Process-safe worker for a chunk of transitions.
+    """
+    out: dict[int, list[np.ndarray]] = {}
+    for idx, src, dst, pts_src, pts_dst, both_have_faces in tasks:
+        out[idx] = _generate_transition_keyframes_worker(
+            src=src,
+            dst=dst,
+            pts_src=pts_src,
+            pts_dst=pts_dst,
+            both_have_faces=both_have_faces,
+            alpha_schedule=alpha_schedule,
+        )
+    return out
 
 
 class GrowingUpPipeline:
@@ -54,6 +116,10 @@ class GrowingUpPipeline:
         self.device = DeviceManager.get_device()
         self.job_id = uuid.uuid4().hex[:8]
         self.stage_previews: list[tuple[int, Image.Image]] = []
+        self.cpu_workers = max(2, min(8, (os.cpu_count() or 4) // 2))
+        self.last_stage_timings: dict[str, float] = {}
+        cv2.setUseOptimized(True)
+        cv2.setNumThreads(max(1, self.cpu_workers))
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -160,6 +226,22 @@ class GrowingUpPipeline:
         warper = TriangleWarper()
         n_trans = len(refined_images) - 1
         morph_keyframes: list[np.ndarray] = []
+        single_plan = compute_transition_plan(
+            transition_style=pc.transition_style,
+            transition_duration_seconds=pc.transition_duration_seconds,
+            fps_output=vc.fps_output,
+            rife_multiplier=vc.rife_multiplier,
+            num_images=max(2, len(refined_images)),
+            turbo_mode=pc.enable_turbo_mode,
+            output_width=out_w,
+            output_height=out_h,
+        )
+        alpha_schedule_single = self._alpha_schedule(
+            count=pc.frames_per_transition,
+            style=str(single_plan["style"]),
+            pause_fraction=float(single_plan["pause_fraction"]),
+            smoothing_window=int(single_plan["smoothing_window"]),
+        )
 
         for i in range(n_trans):
             img_src = np.array(refined_images[i].resize((out_w, out_h), Image.LANCZOS))
@@ -173,7 +255,7 @@ class GrowingUpPipeline:
             triangles = morpher.compute_triangulation(pts_src, pts_dst, (out_h, out_w))
 
             for f in range(pc.frames_per_transition):
-                alpha = f / max(pc.frames_per_transition - 1, 1)
+                alpha = alpha_schedule_single[f]
                 frame = warper.morph_frame(
                     img_src_bgr, img_dst_bgr, pts_src, pts_dst, triangles, alpha
                 )
@@ -206,29 +288,40 @@ class GrowingUpPipeline:
         # ── Stage 8: Ken Burns effect ─────────────────────────────────
         report(0.80, "Applying Ken Burns cinematic zoom…")
         kb = KenBurnsEffect(output_size=(out_w, out_h))
+        single_motion_scale = float(single_plan["camera_motion_scale"])
+        zoom_end = 1.0 + (vc.ken_burns_zoom_max - 1.0) * single_motion_scale
+        pan_x_end = vc.ken_burns_pan_x * single_motion_scale
+        pan_y_end = vc.ken_burns_pan_y * single_motion_scale
         kb_frames = kb.apply_sequence(
             interpolated,
             zoom_start=1.0,
-            zoom_end=vc.ken_burns_zoom_max,
-            pan_x_end=vc.ken_burns_pan_x,
-            pan_y_end=vc.ken_burns_pan_y,
+            zoom_end=zoom_end,
+            pan_x_end=pan_x_end,
+            pan_y_end=pan_y_end,
         )
 
-        # ── Stage 9: Write frames ─────────────────────────────────────
-        report(0.85, "Writing frames to disk…")
-        writer = FrameWriter(frame_dir)
-        writer.write_all(kb_frames)
-
-        # ── Stage 10: FFmpeg render ────────────────────────────────────
-        report(0.90, "Rendering 1080p MP4 with FFmpeg…")
-        renderer = VideoRenderer(cfg)
-        renderer.render(
-            frame_dir=frame_dir,
-            output_path=output_path,
+        # ── Stage 9/10: Stream frames directly to FFmpeg ─────────────
+        report(0.85, "Streaming frames to FFmpeg...")
+        pipe = FFmpegPipeWriter(
+            output_path,
+            width=out_w,
+            height=out_h,
             fps=vc.fps_output,
-            total_frames=len(kb_frames),
-            progress_callback=lambda p: report(0.90 + 0.10 * p, "Encoding video…"),
+            crf=vc.crf,
+            codec=vc.codec,
+            preset=vc.preset,
+            pixel_format=vc.pixel_format,
         )
+        total_frames = max(len(kb_frames), 1)
+        pipe.open()
+        try:
+            for i, frame in enumerate(kb_frames):
+                pipe.write(frame)
+                if i % 30 == 0 or i == total_frames - 1:
+                    p = (i + 1) / total_frames
+                    report(0.85 + 0.15 * p, "Encoding video...")
+        finally:
+            pipe.close()
 
         report(1.00, "Done!")
         return output_path
@@ -242,227 +335,214 @@ class GrowingUpPipeline:
         progress_callback: Callable[[float, str], None] | None = None,
     ) -> Path:
         """
-        Multi-image pipeline — optimised for speed.
+        Multi-image pipeline optimized for throughput.
 
-        Key optimisations vs. the original implementation:
-          1. Morph at reduced resolution (MORPH_SIZE) instead of full 1080p
-          2. Use RIFE 4× GPU interpolation to fill frames between morph keyframes
-          3. Upscale to output resolution only after interpolation
-          4. Pipe frames directly to FFmpeg (no PNG on disk)
-          5. OpenCV-only caption rendering (no PIL round-trips)
-          6. Hold frames written once + repeated via pipe
-
-        Args:
-            input_images: List of PIL RGB photos in chronological order
-            progress_callback: fn(progress: float [0,1], message: str)
-
-        Returns:
-            Path to the rendered MP4 file
+        Key optimizations:
+          1. Dynamic morph resolution and hold frames (turbo profile)
+          2. Transition-by-transition processing (no giant in-memory frame lists)
+          3. Direct FFmpeg pipe with optional upscale in FFmpeg
+          4. Optional RIFE interpolation per transition
         """
         cfg = self.config
         vc = cfg.video
 
         output_path = cfg.output_dir / f"growing_up_{self.job_id}.mp4"
-        frame_dir = cfg.tmp_dir / self.job_id
-        frame_dir.mkdir(parents=True, exist_ok=True)
+        n_images = len(input_images)
+        if n_images < 2:
+            raise ValueError("run_multi_image requires at least 2 images")
 
         def report(p: float, msg: str) -> None:
             logger.info("[%.0f%%] %s", p * 100, msg)
             if progress_callback:
                 progress_callback(p, msg)
 
+        stage_times: dict[str, float] = {}
+        t_prepare = perf_counter()
         out_w, out_h = vc.output_width, vc.output_height
+        profile = compute_transition_plan(
+            transition_style=cfg.pipeline.transition_style,
+            transition_duration_seconds=cfg.pipeline.transition_duration_seconds,
+            fps_output=vc.fps_output,
+            rife_multiplier=vc.rife_multiplier,
+            num_images=n_images,
+            turbo_mode=cfg.pipeline.enable_turbo_mode,
+            output_width=out_w,
+            output_height=out_h,
+        )
 
-        # ── Morph resolution ──────────────────────────────────────────
-        # Work at a smaller size for morphing; upscale afterwards.
-        # 768 keeps good face detail while being ~6× cheaper than 1080p.
-        MORPH_H = 768
-        MORPH_W = int(MORPH_H * out_w / out_h)  # maintain aspect ratio
-        # Ensure even dimensions for RIFE (needs multiples of 32 ideally)
-        MORPH_W = (MORPH_W // 32) * 32 or 768
-        MORPH_H = (MORPH_H // 32) * 32 or 768
+        morph_w = int(profile["morph_w"])
+        morph_h = int(profile["morph_h"])
+        keyframes_per_transition = max(2, int(profile["keyframes_per_transition"]))
+        hold_count = max(2, int(profile["hold_frames"]))
+        style_name = str(profile["style"])
+        pause_fraction = float(profile["pause_fraction"])
+        smoothing_window = max(1, int(profile["smoothing_window"]))
+        camera_motion_scale = float(profile["camera_motion_scale"])
+        stage_times["transition_duration_s"] = float(profile["transition_duration_seconds"])
+        stage_times["transition_frames"] = float(profile["transition_output_frames"])
 
-        # ── Stage 1: Prepare images at BOTH resolutions ───────────────
-        report(0.02, f"Preparing {len(input_images)} images…")
-        full_images: list[Image.Image] = []
-        for img in input_images:
-            resized = self._fit_to_canvas(img, out_w, out_h)
-            full_images.append(resized)
-
-        # Store previews
+        report(0.02, f"Preparing {n_images} images...")
+        morph_bgr: list[np.ndarray] = []
         self.stage_previews = []
-        for i, img in enumerate(full_images):
-            thumb = img.resize((128, 128), Image.LANCZOS)
-            self.stage_previews.append((i, thumb))
 
-        # ── Stage 2: Face detection & landmark extraction (at morph res) ─
-        report(0.05, "Detecting faces and extracting landmarks…")
+        for i, img in enumerate(input_images):
+            fitted = self._fit_to_canvas(img, out_w, out_h)
+            self.stage_previews.append((i, fitted.resize((128, 128), Image.LANCZOS)))
+            morph_img = fitted.resize((morph_w, morph_h), Image.LANCZOS)
+            morph_bgr.append(cv2.cvtColor(np.array(morph_img), cv2.COLOR_RGB2BGR))
+        stage_times["prepare_images"] = perf_counter() - t_prepare
+
+        t_landmarks = perf_counter()
+        report(0.05, "Detecting faces and extracting landmarks...")
         aligner = FaceAligner(cfg.model.insightface_model)
         lm_extractor = LandmarkExtractor(aligner)
         all_landmarks: list[np.ndarray] = []
         face_detected: list[bool] = []
 
-        # Convert to morph-size BGR arrays for morphing
-        morph_bgr: list[np.ndarray] = []
-        for i, img in enumerate(full_images):
-            morph_img = img.resize((MORPH_W, MORPH_H), Image.LANCZOS)
-            bgr = cv2.cvtColor(np.array(morph_img), cv2.COLOR_RGB2BGR)
-            morph_bgr.append(bgr)
-
-            # Detect landmarks at morph resolution
+        for i, bgr in enumerate(morph_bgr):
             try:
                 lm = lm_extractor.extract_landmarks(bgr)
                 all_landmarks.append(lm)
                 face_detected.append(True)
             except ValueError:
-                logger.warning(f"No face detected in image {i} — using cross-dissolve")
+                logger.warning("No face detected in image %d - using cross-dissolve", i)
                 all_landmarks.append(np.zeros((68, 2), dtype=np.float32))
                 face_detected.append(False)
+        stage_times["landmarks"] = perf_counter() - t_landmarks
 
-        # Pre-convert full images to BGR for hold frames (at output res)
-        full_bgr: list[np.ndarray] = []
-        for img in full_images:
-            full_bgr.append(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR))
-        del full_images
-        _free_memory()
-
-        # ── Stage 3: Morph keyframes at low resolution ────────────────
-        report(0.10, "Morphing transitions at reduced resolution…")
-        morpher = DelaunayMorpher()
-        warper = TriangleWarper()
-
-        keyframes_per_transition = max(8, cfg.pipeline.frames_per_transition)
-        hold_count = 30  # ~0.5 s at 60fps
-
-        # Build caption list
         cap_list: list[str] = []
         if captions:
             cap_list = [c.strip() if c else "" for c in captions]
-        while len(cap_list) < len(input_images):
+        while len(cap_list) < n_images:
             cap_list.append("")
 
-        n_trans = len(morph_bgr) - 1
-
-        # Generate morph keyframes per transition (at MORPH_W × MORPH_H)
-        # Each entry: list of BGR frames for that transition
-        transition_keyframes: list[list[np.ndarray]] = []
-
-        for i in range(n_trans):
-            img_src_bgr = morph_bgr[i]
-            img_dst_bgr = morph_bgr[i + 1]
-            pts_src = all_landmarks[i]
-            pts_dst = all_landmarks[i + 1]
-            both_have_faces = face_detected[i] and face_detected[i + 1]
-
-            frames_this: list[np.ndarray] = []
-
-            if both_have_faces:
-                triangles = morpher.compute_triangulation(
-                    pts_src, pts_dst, (MORPH_H, MORPH_W)
-                )
-                for f in range(keyframes_per_transition):
-                    alpha = f / max(keyframes_per_transition - 1, 1)
-                    alpha = self._ease_in_out(alpha)
-                    frame = warper.morph_frame(
-                        img_src_bgr, img_dst_bgr,
-                        pts_src, pts_dst, triangles, alpha,
-                    )
-                    frames_this.append(frame)
-            else:
-                # No face landmarks — fall back to cross-dissolve
-                for f in range(keyframes_per_transition):
-                    alpha = f / max(keyframes_per_transition - 1, 1)
-                    alpha = self._ease_in_out(alpha)
-                    frame = cv2.addWeighted(
-                        img_src_bgr, 1.0 - alpha,
-                        img_dst_bgr, alpha, 0,
-                    )
-                    frames_this.append(frame)
-
-            transition_keyframes.append(frames_this)
-            p_frac = 0.10 + 0.20 * ((i + 1) / n_trans)
-            report(p_frac, f"Morphing keyframes {i + 1}/{n_trans}…")
-
-        del morph_bgr
-        _free_memory()
-
-        # ── Stage 4: RIFE interpolation on morph keyframes ────────────
+        n_trans = n_images - 1
         rife_weights = cfg.rife_weights_path
-        rife_mult = vc.rife_multiplier if vc.rife_multiplier > 1 else 4
+        rife_mult = vc.rife_multiplier if vc.rife_multiplier > 1 else 1
+        transition_out_frames = (
+            int(profile["transition_output_frames"]) if rife_weights.exists() and rife_mult > 1
+            else keyframes_per_transition
+        )
 
-        interpolated_transitions: list[list[np.ndarray]] = []
+        total_output_frames = hold_count
+        total_output_frames += n_trans * (transition_out_frames + hold_count)
 
-        if rife_weights.exists():
-            report(0.30, "Loading RIFE interpolator…")
-            rife = RIFEInterpolator(str(rife_weights), self.device)
-
-            for i, kf_list in enumerate(transition_keyframes):
-                report(
-                    0.32 + 0.20 * (i / n_trans),
-                    f"RIFE {rife_mult}× interpolation — transition {i + 1}/{n_trans}…",
-                )
-                interp = rife.interpolate_sequence(
-                    kf_list,
-                    multiplier=rife_mult,
-                )
-                interpolated_transitions.append(interp)
-
-            del rife
-            _free_memory()
-        else:
-            logger.warning("RIFE weights not found — skipping interpolation (slower output)")
-            interpolated_transitions = transition_keyframes
-
-        del transition_keyframes
-        _free_memory()
-
-        # ── Stage 5: Upscale + Ken Burns + captions → FFmpeg pipe ─────
-        report(0.55, "Upscaling and encoding video…")
-
-        # Calculate total output frames for Ken Burns / fade progress
-        total_output_frames = hold_count  # first image hold
-        for interp_frames in interpolated_transitions:
-            total_output_frames += len(interp_frames) + hold_count
-
-        kb = KenBurnsEffect(output_size=(out_w, out_h))
-        fade_frames = 30 if fade_in_out else 0
+        kb = KenBurnsEffect(output_size=(morph_w, morph_h))
+        fade_frames = min(int(profile["fade_frames"]), hold_count) if fade_in_out else 0
+        zoom_end = 1.0 + (vc.ken_burns_zoom_max - 1.0) * camera_motion_scale
+        pan_x_end = vc.ken_burns_pan_x * camera_motion_scale
+        pan_y_end = vc.ken_burns_pan_y * camera_motion_scale
         global_frame_idx = 0
 
         pipe = FFmpegPipeWriter(
             output_path,
-            width=out_w,
-            height=out_h,
+            width=morph_w,
+            height=morph_h,
             fps=vc.fps_output,
             crf=vc.crf,
             codec=vc.codec,
             preset=vc.preset,
             pixel_format=vc.pixel_format,
+            scale_width=out_w,
+            scale_height=out_h,
         )
         pipe.open()
 
+        morpher = DelaunayMorpher()
+        warper = TriangleWarper()
+
+        rife: RIFEInterpolator | None = None
+        if rife_weights.exists() and rife_mult > 1:
+            report(0.18, "Loading RIFE interpolator...")
+            try:
+                rife = RIFEInterpolator(str(rife_weights), self.device)
+            except Exception as exc:
+                logger.warning("RIFE unavailable (%s). Falling back to non-interpolated transitions.", exc)
+                rife = None
+
+        report(0.20, "Generating transitions...")
+        alpha_schedule = self._alpha_schedule(
+            count=keyframes_per_transition,
+            style=style_name,
+            pause_fraction=pause_fraction,
+            smoothing_window=smoothing_window,
+        )
+        t_morph_total = 0.0
+        t_rife_total = 0.0
+        t_encode = perf_counter()
+
         try:
+            process_workers = max(1, int(cfg.pipeline.transition_process_workers))
+            use_process_pool = process_workers > 1 and n_trans >= (process_workers + 1)
+            chunked_parallel = bool(cfg.pipeline.enable_chunked_parallel) and use_process_pool
+            chunk_size = max(1, int(cfg.pipeline.transition_chunk_size))
+            stage_times["process_workers"] = float(process_workers)
+            stage_times["multiprocess_mode"] = 1.0 if use_process_pool else 0.0
+            stage_times["chunked_parallel"] = 1.0 if chunked_parallel else 0.0
+            stage_times["chunk_size"] = float(chunk_size)
+            process_pool: ProcessPoolExecutor | None = None
+            pending_frames: dict[int, object] = {}
+            pending_chunks: dict[int, object] = {}
+            chunk_results: dict[int, dict[int, list[np.ndarray]]] = {}
+            next_chunk_start = 0
+
+            if use_process_pool:
+                process_pool = ProcessPoolExecutor(max_workers=process_workers)
+                if chunked_parallel:
+                    in_flight = 0
+                    while next_chunk_start < n_trans and in_flight < process_workers:
+                        start = next_chunk_start
+                        end = min(n_trans, start + chunk_size)
+                        tasks = [
+                            (
+                                idx,
+                                morph_bgr[idx],
+                                morph_bgr[idx + 1],
+                                all_landmarks[idx],
+                                all_landmarks[idx + 1],
+                                face_detected[idx] and face_detected[idx + 1],
+                            )
+                            for idx in range(start, end)
+                        ]
+                        pending_chunks[start] = process_pool.submit(
+                            _generate_transition_chunk_worker,
+                            tasks,
+                            alpha_schedule,
+                        )
+                        next_chunk_start = end
+                        in_flight += 1
+                else:
+                    prefetch = min(n_trans, process_workers * 2)
+                    for idx in range(prefetch):
+                        pending_frames[idx] = process_pool.submit(
+                            _generate_transition_keyframes_worker,
+                            morph_bgr[idx],
+                            morph_bgr[idx + 1],
+                            all_landmarks[idx],
+                            all_landmarks[idx + 1],
+                            face_detected[idx] and face_detected[idx + 1],
+                            alpha_schedule,
+                        )
+
             def _process_and_write(frame_bgr: np.ndarray, caption: str = "") -> None:
-                """Apply KB + caption + fade, write to FFmpeg pipe."""
                 nonlocal global_frame_idx
 
-                # Ken Burns
                 f = kb.apply_single(
-                    frame_bgr, global_frame_idx, total_output_frames,
+                    frame_bgr,
+                    global_frame_idx,
+                    total_output_frames,
                     zoom_start=1.0,
-                    zoom_end=vc.ken_burns_zoom_max,
-                    pan_x_end=vc.ken_burns_pan_x,
-                    pan_y_end=vc.ken_burns_pan_y,
+                    zoom_end=zoom_end,
+                    pan_x_end=pan_x_end,
+                    pan_y_end=pan_y_end,
                 )
 
-                # Caption (OpenCV only — no PIL round-trip)
                 if caption:
                     f = self._apply_caption_cv2(f, caption)
 
-                # Fade in
                 if fade_in_out and global_frame_idx < fade_frames:
                     factor = global_frame_idx / max(fade_frames, 1)
                     f = (f.astype(np.float32) * factor).astype(np.uint8)
-                # Fade out
                 if fade_in_out and global_frame_idx >= total_output_frames - fade_frames:
                     remaining = total_output_frames - 1 - global_frame_idx
                     factor = remaining / max(fade_frames, 1)
@@ -471,59 +551,156 @@ class GrowingUpPipeline:
                 pipe.write(f)
                 global_frame_idx += 1
 
-            def _write_hold(hold_bgr: np.ndarray, caption: str, count: int) -> None:
-                """Write hold frames — reuses same source frame."""
+            def _write_hold(frame_bgr: np.ndarray, caption: str, count: int) -> None:
                 for _ in range(count):
-                    _process_and_write(hold_bgr, caption)
+                    _process_and_write(frame_bgr, caption)
 
-            # --- Write frames per transition ---
             for i in range(n_trans):
+                src = morph_bgr[i]
+                dst = morph_bgr[i + 1]
                 src_caption = cap_list[i]
                 dst_caption = cap_list[i + 1]
 
-                # Hold on first image
                 if i == 0:
-                    _write_hold(full_bgr[0], src_caption, hold_count)
+                    _write_hold(src, src_caption, hold_count)
 
-                # Write interpolated transition frames (upscale from morph res)
-                interp_frames = interpolated_transitions[i]
-                for fi, morph_frame in enumerate(interp_frames):
-                    # Upscale from MORPH_W×MORPH_H to output resolution
-                    upscaled = cv2.resize(
-                        morph_frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR
-                    )
+                both_have_faces = face_detected[i] and face_detected[i + 1]
+                frames_this: list[np.ndarray] = []
+
+                if use_process_pool and process_pool is not None:
+                    if chunked_parallel:
+                        chunk_start = (i // chunk_size) * chunk_size
+                        if chunk_start not in chunk_results:
+                            t0 = perf_counter()
+                            future = pending_chunks.pop(chunk_start)
+                            chunk_results[chunk_start] = future.result()  # type: ignore[assignment]
+                            t_morph_total += perf_counter() - t0
+
+                            if next_chunk_start < n_trans:
+                                start = next_chunk_start
+                                end = min(n_trans, start + chunk_size)
+                                tasks = [
+                                    (
+                                        idx,
+                                        morph_bgr[idx],
+                                        morph_bgr[idx + 1],
+                                        all_landmarks[idx],
+                                        all_landmarks[idx + 1],
+                                        face_detected[idx] and face_detected[idx + 1],
+                                    )
+                                    for idx in range(start, end)
+                                ]
+                                pending_chunks[start] = process_pool.submit(
+                                    _generate_transition_chunk_worker,
+                                    tasks,
+                                    alpha_schedule,
+                                )
+                                next_chunk_start = end
+
+                        frames_this = chunk_results[chunk_start].pop(i)
+                        if not chunk_results[chunk_start]:
+                            del chunk_results[chunk_start]
+                    else:
+                        t0 = perf_counter()
+                        future = pending_frames.pop(i)
+                        frames_this = future.result()  # type: ignore[assignment]
+                        t_morph_total += perf_counter() - t0
+                        next_idx = i + (process_workers * 2)
+                        if next_idx < n_trans:
+                            pending_frames[next_idx] = process_pool.submit(
+                                _generate_transition_keyframes_worker,
+                                morph_bgr[next_idx],
+                                morph_bgr[next_idx + 1],
+                                all_landmarks[next_idx],
+                                all_landmarks[next_idx + 1],
+                                face_detected[next_idx] and face_detected[next_idx + 1],
+                                alpha_schedule,
+                            )
+                else:
+                    if both_have_faces:
+                        t0 = perf_counter()
+                        triangles = morpher.compute_triangulation(
+                            all_landmarks[i],
+                            all_landmarks[i + 1],
+                            (morph_h, morph_w),
+                        )
+                        pts_all_src, pts_all_dst = warper._build_border_pts(
+                            all_landmarks[i],
+                            all_landmarks[i + 1],
+                            morph_h,
+                            morph_w,
+                        )
+                        src_f = src.astype(np.float32)
+                        dst_f = dst.astype(np.float32)
+
+                        def _make_morph_frame(fidx: int) -> np.ndarray:
+                            alpha = alpha_schedule[fidx]
+                            return warper.morph_frame_precomputed(
+                                img_src_f=src_f,
+                                img_dst_f=dst_f,
+                                pts_all_src=pts_all_src,
+                                pts_all_dst=pts_all_dst,
+                                triangles=triangles,
+                                alpha=alpha,
+                            )
+
+                        if keyframes_per_transition >= 14 and self.cpu_workers > 1:
+                            with ThreadPoolExecutor(max_workers=self.cpu_workers) as ex:
+                                frames_this = list(ex.map(_make_morph_frame, range(keyframes_per_transition)))
+                        else:
+                            frames_this = [_make_morph_frame(fidx) for fidx in range(keyframes_per_transition)]
+                        t_morph_total += perf_counter() - t0
+                    else:
+                        t0 = perf_counter()
+                        for fidx in range(keyframes_per_transition):
+                            alpha = alpha_schedule[fidx]
+                            frames_this.append(
+                                cv2.addWeighted(src, 1.0 - alpha, dst, alpha, 0)
+                            )
+                        t_morph_total += perf_counter() - t0
+
+                report(0.20 + 0.30 * ((i + 1) / n_trans), f"Morphing keyframes {i + 1}/{n_trans}...")
+
+                if rife is not None:
+                    t0 = perf_counter()
+                    interp_frames = rife.interpolate_sequence(frames_this, multiplier=rife_mult)
+                    t_rife_total += perf_counter() - t0
+                else:
+                    interp_frames = frames_this
+
+                for fi, frame in enumerate(interp_frames):
                     alpha = fi / max(len(interp_frames) - 1, 1)
                     cap = src_caption if alpha < 0.5 else dst_caption
-                    _process_and_write(upscaled, cap)
+                    _process_and_write(frame, cap)
 
-                # Hold on destination image (full res — no upscale needed)
-                _write_hold(full_bgr[i + 1], dst_caption, hold_count)
+                _write_hold(dst, dst_caption, hold_count)
 
-                # Free source if no longer needed
-                if i > 0:
-                    full_bgr[i] = None  # type: ignore[assignment]
-
-                # Free transition data
-                interpolated_transitions[i] = []  # type: ignore[assignment]
+                report(0.55 + 0.35 * ((i + 1) / n_trans), f"Encoding transition {i + 1}/{n_trans}...")
                 _free_memory()
 
-                p_frac = 0.55 + 0.30 * ((i + 1) / n_trans)
-                report(p_frac, f"Encoding transition {i + 1}/{n_trans}…")
-
         finally:
+            if 'process_pool' in locals() and process_pool is not None:
+                process_pool.shutdown(wait=True, cancel_futures=True)
+            if rife is not None:
+                del rife
             pipe.close()
+            _free_memory()
+        stage_times["morph_total"] = t_morph_total
+        stage_times["rife_total"] = t_rife_total
+        stage_times["encode_pipe"] = perf_counter() - t_encode
 
-        del full_bgr, interpolated_transitions
-        _free_memory()
-
-        # ── Stage 6: Add background music if provided ─────────────────
         if music_path:
-            report(0.90, "Adding background music…")
+            t_mux = perf_counter()
+            report(0.93, "Adding background music...")
             renderer = VideoRenderer(cfg)
             renderer.mux_audio(
                 video_path=output_path,
                 audio_path=Path(music_path),
             )
+            stage_times["mux_audio"] = perf_counter() - t_mux
+
+        self.last_stage_timings = stage_times
+        logger.info("Stage timings (s): %s", {k: round(v, 2) for k, v in stage_times.items()})
 
         report(1.00, "Done!")
         return output_path
@@ -566,6 +743,55 @@ class GrowingUpPipeline:
             font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA,
         )
         return result
+
+    @staticmethod
+    def _style_ease(t: float, style: str) -> float:
+        t = max(0.0, min(1.0, float(t)))
+        s = style.strip().lower()
+        if s == "emotional":
+            # Smoother, more dramatic curve.
+            return t * t * t * (t * (6 * t - 15) + 10)  # smootherstep
+        if s == "fast":
+            # Snappier and more direct.
+            return t * t * (3 - 2 * t) if t < 0.5 else t
+        # Balanced
+        return GrowingUpPipeline._ease_in_out(t)
+
+    @staticmethod
+    def _alpha_schedule(
+        count: int,
+        style: str,
+        pause_fraction: float,
+        smoothing_window: int,
+    ) -> list[float]:
+        if count <= 1:
+            return [0.0]
+        n = max(2, int(count))
+        pause = max(0.0, min(0.2, float(pause_fraction)))
+        vals: list[float] = []
+        for i in range(n):
+            t = i / (n - 1)
+            if pause > 0.0:
+                if t <= pause:
+                    remapped = 0.0
+                elif t >= 1.0 - pause:
+                    remapped = 1.0
+                else:
+                    remapped = (t - pause) / max(1e-6, (1.0 - 2.0 * pause))
+            else:
+                remapped = t
+            vals.append(GrowingUpPipeline._style_ease(remapped, style))
+
+        win = max(1, int(smoothing_window))
+        if win <= 1:
+            vals[0], vals[-1] = 0.0, 1.0
+            return vals
+        kernel = np.ones(win, dtype=np.float32) / float(win)
+        pad = win // 2
+        padded = np.pad(np.array(vals, dtype=np.float32), (pad, pad), mode="edge")
+        smoothed = np.convolve(padded, kernel, mode="valid").tolist()
+        smoothed[0], smoothed[-1] = 0.0, 1.0
+        return [float(max(0.0, min(1.0, v))) for v in smoothed]
 
     @staticmethod
     def _ease_in_out(t: float) -> float:

@@ -18,11 +18,17 @@ class SessionState:
     output_path: Optional[str] = None
     error_message: Optional[str] = None
     preview_frames: list = field(default_factory=list)
+    stage_timings: dict = field(default_factory=dict)
     # New feature settings
     image_captions: list[str] = field(default_factory=list)
-    transition_speed: str = "normal"  # slow / normal / fast
+    transition_style: str = "Balanced"  # Emotional / Balanced / Fast
+    transition_duration_seconds: float = 2.5
+    transition_process_workers: int = 3
+    chunked_parallel: bool = True
+    transition_chunk_size: int = 2
     resolution: str = "1080p"  # 720p / 1080p / 4K
-    performance_mode: str = "balanced"  # fast / balanced / quality
+    performance_mode: str = "balanced"  # includes extreme_* presets
+    turbo_mode: bool = True
     music_path: Optional[str] = None
     fade_enabled: bool = True
 

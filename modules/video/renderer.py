@@ -5,6 +5,9 @@ import subprocess
 from pathlib import Path
 from typing import Callable
 
+from modules.video.ffmpeg_pipe import _video_encode_args
+from utils.ffmpeg import resolve_ffmpeg_binary
+
 
 class VideoRenderer:
     """
@@ -28,13 +31,12 @@ class VideoRenderer:
         fps = fps or self.config.video.fps_output
         vc = self.config.video
 
+        ffmpeg_bin = resolve_ffmpeg_binary()
         cmd = [
-            "ffmpeg", "-y",
+            ffmpeg_bin, "-y",
             "-framerate", str(fps),
             "-i", str(frame_dir / "%06d.png"),
-            "-c:v", vc.codec,
-            "-preset", vc.preset,
-            "-crf", str(vc.crf),
+            *_video_encode_args(vc.codec, vc.preset, vc.crf),
             "-pix_fmt", vc.pixel_format,
             "-vf", f"scale={vc.output_width}:{vc.output_height}",
             "-movflags", "+faststart",
@@ -73,8 +75,9 @@ class VideoRenderer:
         Overwrites the original video file.
         """
         tmp_out = video_path.with_suffix(".tmp.mp4")
+        ffmpeg_bin = resolve_ffmpeg_binary()
         cmd = [
-            "ffmpeg", "-y",
+            ffmpeg_bin, "-y",
             "-i", str(video_path),
             "-i", str(audio_path),
             "-c:v", "copy",
