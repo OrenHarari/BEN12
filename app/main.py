@@ -37,11 +37,16 @@ RESOLUTION_MAP = {
     "4K":    (3840, 2160),
 }
 
-SPEED_MAP = {
-    "slow":   24,   # morph keyframes per transition (RIFE 4× → 96 final)
-    "normal": 16,   # morph keyframes per transition (RIFE 4× → 64 final)
-    "fast":   10,   # morph keyframes per transition (RIFE 4× → 40 final)
-}
+def _speed_to_keyframes(speed: int) -> int:
+    """Map slider value 1-10 to morph keyframes per transition.
+
+    speed=1  →  6 keyframes (~0.4 s at 60fps with RIFE 4×)
+    speed=5  → 30 keyframes (~2.0 s) — default
+    speed=10 → 60 keyframes (~4.0 s)
+    Formula: keyframes = round(6 + (speed - 1) * 6)
+    """
+    return round(6 + (speed - 1) * 6)
+
 
 PERFORMANCE_PRESETS = {
     "fast": {
@@ -84,11 +89,18 @@ def _sidebar(state):
     )
 
     # Transition speed
-    state.transition_speed = st.sidebar.select_slider(
+    if not isinstance(state.transition_speed, int):
+        state.transition_speed = 5
+
+    state.transition_speed = st.sidebar.slider(
         "Transition Speed",
-        options=["slow", "normal", "fast"],
+        min_value=1,
+        max_value=10,
         value=state.transition_speed,
-        help="Slow = longer, smoother transitions. Fast = quicker cuts.",
+        help=(
+            "1 = fastest cuts (~0.4 s per transition). "
+            "10 = slowest, most cinematic (~4.0 s per transition)."
+        ),
         disabled=state.is_processing,
     )
 
@@ -166,7 +178,7 @@ def _run_pipeline(images, captions, config, state):
         w, h = RESOLUTION_MAP[state.resolution]
         config.video.output_width = w
         config.video.output_height = h
-        config.pipeline.frames_per_transition = SPEED_MAP[state.transition_speed]
+        config.pipeline.frames_per_transition = _speed_to_keyframes(state.transition_speed)
 
         preset = PERFORMANCE_PRESETS[state.performance_mode]
         config.pipeline.sdxl_steps = preset["sdxl_steps"]
@@ -336,7 +348,7 @@ def main():
             st.subheader(f"Video from {num_images} Photos")
             c1, c2 = st.columns(2)
             c1.metric("Transitions", f"{num_images - 1}")
-            c2.metric("Speed", state.transition_speed.title())
+            c2.metric("Transition Speed", f"{state.transition_speed}/10")
             st.success(f"✨ Smooth transitions between your {num_images} photos")
 
         st.subheader("Output Spec")

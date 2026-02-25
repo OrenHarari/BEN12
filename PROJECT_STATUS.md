@@ -1,7 +1,7 @@
 # 🎬 AI Growing Up Video Generator - Project Status
 
-**Last Updated:** February 23, 2026  
-**Branch:** `claude/ai-growing-up-video-t1aZ8`  
+**Last Updated:** February 25, 2026
+**Branch:** `claude/optimize-video-rendering-X6pg7`
 **Status:** ✅ **FULLY OPERATIONAL**
 
 ---
@@ -65,7 +65,7 @@ Docker:
   - 4× frame interpolation for cinematic smooth motion  
   - Ken Burns zoom for visual interest  
   - H.264 encoding at 1080p/60fps  
-- **Settings:** Configurable resolution (720p/1080p/4K), transition speed, fade effects, background music  
+- **Settings:** Configurable resolution (720p/1080p/4K), transition speed (1-10 slider, 0.4s–4.0s per transition), fade effects, background music
 - **Testing:** `test_pipeline.py` for dry-run validation  
 
 ---
@@ -213,3 +213,31 @@ Docker:
 ---
 
 **Next Action:** Review priorities above and begin Phase 1 implementation! 🚀
+
+---
+
+## 📋 Changelog
+
+### February 25, 2026 — Transition Speed Slider + Video Optimization
+
+**Changes shipped on branch `claude/optimize-video-rendering-X6pg7`:**
+
+1. **Transition Speed: 3-option select → 1-10 numeric slider**
+   - Replaced `slow/normal/fast` dropdown (10–24 keyframes) with a numeric slider 1–10
+   - New range: speed=1 → 6 keyframes (~0.4 s), speed=10 → 60 keyframes (~4.0 s) with RIFE 4×
+   - 10× wider perceptual range — the difference between 1 and 10 is now clearly visible
+   - Default set to 5 (2.0 s per transition, up from the old "normal" at 1.07 s)
+   - Includes stale-session guard for backward compatibility
+
+2. **Fixed metric display crash**
+   - `state.transition_speed.title()` (would crash with int) replaced with `f"{state.transition_speed}/10"`
+
+3. **FFmpeg default preset: `slow` → `medium`**
+   - `VideoConfig.preset` default changed from `"slow"` to `"medium"` for faster fallback encoding
+   - UI-driven runs use the Performance Preset override as before; the quality preset still uses `"slow"`
+
+**Files modified:**
+- `app/state.py` — `transition_speed: str = "normal"` → `transition_speed: int = 5`
+- `app/main.py` — remove `SPEED_MAP`, add `_speed_to_keyframes()`, replace `select_slider` with `slider(1-10)`, fix metric display, update pipeline call
+- `app/config.py` — default FFmpeg preset `"slow"` → `"medium"`
+- `PROJECT_STATUS.md` — this update

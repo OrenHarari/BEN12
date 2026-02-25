@@ -30,7 +30,7 @@ class VideoConfig:
     ken_burns_pan_y: float = 0.01
     crf: int = 18
     codec: str = "libx264"
-    preset: str = "slow"
+    preset: str = "medium"
     pixel_format: str = "yuv420p"
 
 

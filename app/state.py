@@ -20,7 +20,7 @@ class SessionState:
     preview_frames: list = field(default_factory=list)
     # New feature settings
     image_captions: list[str] = field(default_factory=list)
-    transition_speed: str = "normal"  # slow / normal / fast
+    transition_speed: int = 5  # 1 (fastest) to 10 (slowest)
     resolution: str = "1080p"  # 720p / 1080p / 4K
     performance_mode: str = "balanced"  # fast / balanced / quality
     music_path: Optional[str] = None
