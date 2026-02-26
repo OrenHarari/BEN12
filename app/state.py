@@ -9,6 +9,7 @@ import streamlit as st
 
 @dataclass
 class SessionState:
+    uploaded_media_items: list[dict] = field(default_factory=list)
     uploaded_images: list[Image.Image] = field(default_factory=list)
     uploaded_image: Optional[Image.Image] = None  # for backward compatibility
     job_id: Optional[str] = None
@@ -21,6 +22,7 @@ class SessionState:
     stage_timings: dict = field(default_factory=dict)
     # New feature settings
     image_captions: list[str] = field(default_factory=list)
+    image_text_overlays: list[str] = field(default_factory=list)
     transition_style: str = "Balanced"  # Emotional / Balanced / Fast
     transition_duration_seconds: float = 2.5
     transition_process_workers: int = 3

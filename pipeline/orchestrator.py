@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import os
+import shutil
+import subprocess
 import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
@@ -26,6 +29,7 @@ from modules.video.ffmpeg_pipe import FFmpegPipeWriter
 from modules.video.ken_burns import KenBurnsEffect
 from modules.video.renderer import VideoRenderer
 from utils.device import DeviceManager
+from utils.ffmpeg import resolve_ffmpeg_binary
 from utils.image_utils import bgr_to_pil, pil_to_bgr
 
 logger = logging.getLogger(__name__)
@@ -129,6 +133,7 @@ class GrowingUpPipeline:
         self,
         input_image: Image.Image,
         progress_callback: Callable[[float, str], None] | None = None,
+        preloaded_sdxl: AgeProgressionPipeline | None = None,
     ) -> Path:
         """
         Args:
@@ -167,9 +172,14 @@ class GrowingUpPipeline:
             identity_emb = None
 
         # ── Stage 3: SDXL age-stage generation ────────────────────────
-        report(0.05, "Loading SDXL + IP-Adapter…")
-        sdxl = AgeProgressionPipeline(cfg, self.device)
-        sdxl.load()
+        owns_sdxl = preloaded_sdxl is None
+        if owns_sdxl:
+            report(0.05, "Loading SDXL + IP-Adapter…")
+            sdxl = AgeProgressionPipeline(cfg, self.device)
+            sdxl.load()
+        else:
+            report(0.05, "Using preloaded SDXL + IP-Adapter…")
+            sdxl = preloaded_sdxl
 
         age_stages = pc.age_stages
         stage_images: list[Image.Image] = []
@@ -183,9 +193,10 @@ class GrowingUpPipeline:
             thumb = gen.resize((128, 128), Image.LANCZOS)
             self.stage_previews.append((age, thumb))
 
-        report(0.40, "Unloading SDXL…")
-        sdxl.unload()
-        _free_memory()
+        if owns_sdxl:
+            report(0.40, "Unloading SDXL…")
+            sdxl.unload()
+            _free_memory()
 
         # ── Stage 4: GFPGAN face refinement ───────────────────────────
         report(0.42, "Refining faces with GFPGANv1.4…")
@@ -429,6 +440,8 @@ class GrowingUpPipeline:
 
         kb = KenBurnsEffect(output_size=(morph_w, morph_h))
         fade_frames = min(int(profile["fade_frames"]), hold_count) if fade_in_out else 0
+        if fade_in_out:
+            fade_frames = min(fade_frames, max(1, total_output_frames // 2))
         zoom_end = 1.0 + (vc.ken_burns_zoom_max - 1.0) * camera_motion_scale
         pan_x_end = vc.ken_burns_pan_x * camera_motion_scale
         pan_y_end = vc.ken_burns_pan_y * camera_motion_scale
@@ -704,6 +717,413 @@ class GrowingUpPipeline:
 
         report(1.00, "Done!")
         return output_path
+
+    def run_mixed_timeline(
+        self,
+        media_items: list[dict],
+        captions: list[str] | None = None,
+        fade_in_out: bool = True,
+        music_path: str | None = None,
+        progress_callback: Callable[[float, str], None] | None = None,
+    ) -> Path:
+        """
+        Timeline mode for mixed media (images + MP4 videos).
+
+        Behavior:
+          - Video items are rendered directly in sequence.
+          - Transitions morph from item-end to next item-start.
+          - Caption overlay is applied per item/transition.
+        """
+        cfg = self.config
+        vc = cfg.video
+
+        output_path = cfg.output_dir / f"growing_up_{self.job_id}.mp4"
+        if not media_items:
+            raise ValueError("run_mixed_timeline requires at least 1 timeline item")
+
+        def report(p: float, msg: str) -> None:
+            logger.info("[%.0f%%] %s", p * 100, msg)
+            if progress_callback:
+                progress_callback(p, msg)
+
+        stage_times: dict[str, float] = {}
+        out_w, out_h = vc.output_width, vc.output_height
+        profile = compute_transition_plan(
+            transition_style=cfg.pipeline.transition_style,
+            transition_duration_seconds=cfg.pipeline.transition_duration_seconds,
+            fps_output=vc.fps_output,
+            rife_multiplier=vc.rife_multiplier,
+            num_images=max(2, len(media_items)),
+            turbo_mode=cfg.pipeline.enable_turbo_mode,
+            output_width=out_w,
+            output_height=out_h,
+        )
+
+        morph_w = int(profile["morph_w"])
+        morph_h = int(profile["morph_h"])
+        keyframes_per_transition = max(2, int(profile["keyframes_per_transition"]))
+        hold_count = max(2, int(profile["hold_frames"]))
+        style_name = str(profile["style"])
+        pause_fraction = float(profile["pause_fraction"])
+        smoothing_window = max(1, int(profile["smoothing_window"]))
+        camera_motion_scale = float(profile["camera_motion_scale"])
+
+        report(0.02, f"Preparing {len(media_items)} timeline items...")
+        t_prepare = perf_counter()
+        prepared: list[dict] = []
+        self.stage_previews = []
+
+        for idx, item in enumerate(media_items):
+            kind = str(item.get("kind", "")).lower()
+            if kind == "image":
+                image_obj = item.get("image")
+                if not isinstance(image_obj, Image.Image):
+                    raise ValueError(f"Timeline item {idx + 1} is missing a valid image")
+                fitted = self._fit_to_canvas(image_obj, out_w, out_h)
+                preview = fitted.resize((128, 128), Image.LANCZOS)
+                self.stage_previews.append((idx, preview))
+                morph_img = fitted.resize((morph_w, morph_h), Image.LANCZOS)
+                frame = cv2.cvtColor(np.array(morph_img), cv2.COLOR_RGB2BGR)
+                prepared.append(
+                    {
+                        "kind": "image",
+                        "name": str(item.get("name", f"image_{idx + 1}")),
+                        "frames": [frame],
+                        "start_frame": frame,
+                        "end_frame": frame,
+                    }
+                )
+            elif kind == "video":
+                video_path = item.get("video_path")
+                if not video_path:
+                    raise ValueError(f"Timeline item {idx + 1} is missing video_path")
+                frames = self._decode_video_frames(
+                    video_path=Path(str(video_path)),
+                    out_w=out_w,
+                    out_h=out_h,
+                    morph_w=morph_w,
+                    morph_h=morph_h,
+                    target_fps=vc.fps_output,
+                    max_seconds=float(getattr(cfg.pipeline, "max_video_clip_seconds", 12.0)),
+                )
+                preview_rgb = cv2.cvtColor(frames[0], cv2.COLOR_BGR2RGB)
+                self.stage_previews.append((idx, Image.fromarray(preview_rgb).resize((128, 128), Image.LANCZOS)))
+                prepared.append(
+                    {
+                        "kind": "video",
+                        "name": str(item.get("name", f"video_{idx + 1}")),
+                        "frames": frames,
+                        "start_frame": frames[0],
+                        "end_frame": frames[-1],
+                    }
+                )
+            else:
+                raise ValueError(f"Unsupported timeline item kind at index {idx}: {kind}")
+        stage_times["prepare_items"] = perf_counter() - t_prepare
+
+        report(0.08, "Extracting landmarks from timeline anchors...")
+        t_landmarks = perf_counter()
+        aligner = FaceAligner(cfg.model.insightface_model)
+        lm_extractor = LandmarkExtractor(aligner)
+        for item in prepared:
+            for key in ("start_frame", "end_frame"):
+                frame = item[key]
+                try:
+                    lm = lm_extractor.extract_landmarks(frame)
+                    item[f"{key}_landmarks"] = lm
+                    item[f"{key}_face_ok"] = True
+                except ValueError:
+                    item[f"{key}_landmarks"] = np.zeros((68, 2), dtype=np.float32)
+                    item[f"{key}_face_ok"] = False
+        stage_times["landmarks"] = perf_counter() - t_landmarks
+
+        cap_list: list[str] = []
+        if captions:
+            cap_list = [c.strip() if c else "" for c in captions]
+        while len(cap_list) < len(prepared):
+            cap_list.append("")
+
+        n_trans = max(0, len(prepared) - 1)
+        rife_weights = cfg.rife_weights_path
+        rife_mult = vc.rife_multiplier if vc.rife_multiplier > 1 else 1
+        transition_out_frames = (
+            int(profile["transition_output_frames"]) if rife_weights.exists() and rife_mult > 1
+            else keyframes_per_transition
+        )
+
+        total_output_frames = 0
+        for i, item in enumerate(prepared):
+            if item["kind"] == "image":
+                total_output_frames += hold_count
+            else:
+                frame_count = len(item["frames"])
+                if i > 0 and frame_count > 1:
+                    frame_count -= 1
+                total_output_frames += max(1, frame_count)
+        total_output_frames += n_trans * transition_out_frames
+
+        kb = KenBurnsEffect(output_size=(morph_w, morph_h))
+        fade_frames = min(int(profile["fade_frames"]), hold_count) if fade_in_out else 0
+        if fade_in_out:
+            fade_frames = min(fade_frames, max(1, total_output_frames // 2))
+        zoom_end = 1.0 + (vc.ken_burns_zoom_max - 1.0) * camera_motion_scale
+        pan_x_end = vc.ken_burns_pan_x * camera_motion_scale
+        pan_y_end = vc.ken_burns_pan_y * camera_motion_scale
+        global_frame_idx = 0
+
+        pipe = FFmpegPipeWriter(
+            output_path,
+            width=morph_w,
+            height=morph_h,
+            fps=vc.fps_output,
+            crf=vc.crf,
+            codec=vc.codec,
+            preset=vc.preset,
+            pixel_format=vc.pixel_format,
+            scale_width=out_w,
+            scale_height=out_h,
+        )
+        pipe.open()
+
+        alpha_schedule = self._alpha_schedule(
+            count=keyframes_per_transition,
+            style=style_name,
+            pause_fraction=pause_fraction,
+            smoothing_window=smoothing_window,
+        )
+
+        rife: RIFEInterpolator | None = None
+        t_morph_total = 0.0
+        t_rife_total = 0.0
+        t_encode = perf_counter()
+
+        def _process_and_write(frame_bgr: np.ndarray, caption: str = "") -> None:
+            nonlocal global_frame_idx
+            f = kb.apply_single(
+                frame_bgr,
+                global_frame_idx,
+                max(1, total_output_frames),
+                zoom_start=1.0,
+                zoom_end=zoom_end,
+                pan_x_end=pan_x_end,
+                pan_y_end=pan_y_end,
+            )
+            if caption:
+                f = self._apply_caption_cv2(f, caption)
+            if fade_in_out and global_frame_idx < fade_frames:
+                factor = global_frame_idx / max(fade_frames, 1)
+                f = (f.astype(np.float32) * factor).astype(np.uint8)
+            if fade_in_out and global_frame_idx >= total_output_frames - fade_frames:
+                remaining = total_output_frames - 1 - global_frame_idx
+                factor = remaining / max(fade_frames, 1)
+                f = (f.astype(np.float32) * factor).astype(np.uint8)
+            pipe.write(f)
+            global_frame_idx += 1
+
+        def _write_item_body(item: dict, caption: str, skip_first_video_frame: bool) -> None:
+            if item["kind"] == "image":
+                for _ in range(hold_count):
+                    _process_and_write(item["start_frame"], caption)
+                return
+            frames = item["frames"]
+            start_idx = 1 if skip_first_video_frame and len(frames) > 1 else 0
+            for frame in frames[start_idx:]:
+                _process_and_write(frame, caption)
+
+        try:
+            if rife_weights.exists() and rife_mult > 1 and n_trans > 0:
+                report(0.16, "Loading RIFE interpolator...")
+                try:
+                    rife = RIFEInterpolator(str(rife_weights), self.device)
+                except Exception as exc:
+                    logger.warning("RIFE unavailable (%s). Falling back to non-interpolated transitions.", exc)
+                    rife = None
+
+            report(0.20, "Rendering timeline and transitions...")
+            _write_item_body(prepared[0], cap_list[0], skip_first_video_frame=False)
+
+            for i in range(n_trans):
+                src = prepared[i]
+                dst = prepared[i + 1]
+
+                both_have_faces = bool(src["end_frame_face_ok"] and dst["start_frame_face_ok"])
+                t0 = perf_counter()
+                keyframes = _generate_transition_keyframes_worker(
+                    src=src["end_frame"],
+                    dst=dst["start_frame"],
+                    pts_src=src["end_frame_landmarks"],
+                    pts_dst=dst["start_frame_landmarks"],
+                    both_have_faces=both_have_faces,
+                    alpha_schedule=alpha_schedule,
+                )
+                t_morph_total += perf_counter() - t0
+
+                if rife is not None:
+                    t0 = perf_counter()
+                    frames_out = rife.interpolate_sequence(keyframes, multiplier=rife_mult)
+                    t_rife_total += perf_counter() - t0
+                else:
+                    frames_out = keyframes
+
+                for fi, frame in enumerate(frames_out):
+                    alpha = fi / max(1, len(frames_out) - 1)
+                    cap = cap_list[i] if alpha < 0.5 else cap_list[i + 1]
+                    _process_and_write(frame, cap)
+
+                _write_item_body(dst, cap_list[i + 1], skip_first_video_frame=True)
+
+                report(0.20 + 0.70 * ((i + 1) / max(1, n_trans)), f"Rendered transition {i + 1}/{n_trans}...")
+                _free_memory()
+
+        finally:
+            if rife is not None:
+                del rife
+            pipe.close()
+            _free_memory()
+
+        stage_times["morph_total"] = t_morph_total
+        stage_times["rife_total"] = t_rife_total
+        stage_times["encode_pipe"] = perf_counter() - t_encode
+
+        if music_path:
+            t_mux = perf_counter()
+            report(0.93, "Adding background music...")
+            renderer = VideoRenderer(cfg)
+            renderer.mux_audio(
+                video_path=output_path,
+                audio_path=Path(music_path),
+            )
+            stage_times["mux_audio"] = perf_counter() - t_mux
+
+        self.last_stage_timings = stage_times
+        logger.info("Stage timings (s): %s", {k: round(v, 2) for k, v in stage_times.items()})
+
+        report(1.00, "Done!")
+        return output_path
+
+    def _decode_video_frames(
+        self,
+        video_path: Path,
+        out_w: int,
+        out_h: int,
+        morph_w: int,
+        morph_h: int,
+        target_fps: int,
+        max_seconds: float,
+    ) -> list[np.ndarray]:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise ValueError(f"Could not open video: {video_path}")
+        if hasattr(cv2, "CAP_PROP_ORIENTATION_AUTO"):
+            # Disable backend auto-rotation so we can apply metadata consistently.
+            cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
+
+        rotation_deg = self._read_video_rotation_degrees(video_path)
+
+        src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        if src_fps <= 0.1:
+            src_fps = float(max(1, target_fps))
+        max_src_frames = int(max(1.0, max_seconds) * src_fps)
+
+        raw_frames: list[np.ndarray] = []
+        frame_idx = 0
+        try:
+            while frame_idx < max_src_frames:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                frame = self._rotate_frame_bgr(frame, rotation_deg)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                fitted = self._fit_to_canvas(Image.fromarray(rgb), out_w, out_h)
+                morph_img = fitted.resize((morph_w, morph_h), Image.LANCZOS)
+                raw_frames.append(cv2.cvtColor(np.array(morph_img), cv2.COLOR_RGB2BGR))
+                frame_idx += 1
+        finally:
+            cap.release()
+
+        if not raw_frames:
+            raise ValueError(f"Video has no readable frames: {video_path}")
+
+        duration_sec = len(raw_frames) / max(src_fps, 1.0)
+        target_count = int(round(duration_sec * max(1, target_fps)))
+        target_count = max(1, min(target_count, int(max(1.0, max_seconds) * max(1, target_fps))))
+        if target_count >= len(raw_frames):
+            return raw_frames
+
+        idxs = np.linspace(0, len(raw_frames) - 1, num=target_count).round().astype(np.int32)
+        return [raw_frames[int(i)] for i in idxs]
+
+    def _read_video_rotation_degrees(self, video_path: Path) -> int:
+        """
+        Return normalized rotation in {0, 90, 180, 270} from video metadata.
+        """
+        ffprobe_bin = self._resolve_ffprobe_binary()
+        if ffprobe_bin is None:
+            return 0
+
+        cmd = [
+            ffprobe_bin,
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream_tags=rotate:stream_side_data=rotation",
+            "-of", "json",
+            str(video_path),
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
+            if result.returncode != 0 or not result.stdout.strip():
+                return 0
+            payload = json.loads(result.stdout)
+            streams = payload.get("streams") or []
+            if not streams:
+                return 0
+            stream = streams[0]
+
+            rotation_val = None
+            tags = stream.get("tags") or {}
+            if "rotate" in tags:
+                rotation_val = tags.get("rotate")
+            side_data = stream.get("side_data_list") or stream.get("side_data") or []
+            if side_data and isinstance(side_data, list):
+                for entry in side_data:
+                    if isinstance(entry, dict) and "rotation" in entry:
+                        rotation_val = entry.get("rotation")
+                        break
+            if rotation_val is None:
+                return 0
+
+            degrees = int(round(float(rotation_val))) % 360
+            snapped = min((0, 90, 180, 270), key=lambda d: abs(d - degrees))
+            return int(snapped)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _resolve_ffprobe_binary() -> str | None:
+        env = os.environ.get("FFPROBE_BINARY")
+        if env:
+            return env
+        probe = shutil.which("ffprobe")
+        if probe:
+            return probe
+        try:
+            ffmpeg_bin = resolve_ffmpeg_binary()
+            candidate = Path(ffmpeg_bin).with_name("ffprobe")
+            if candidate.exists():
+                return str(candidate)
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _rotate_frame_bgr(frame: np.ndarray, rotation_deg: int) -> np.ndarray:
+        if rotation_deg == 90:
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        if rotation_deg == 180:
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        if rotation_deg == 270:
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        return frame
 
     @staticmethod
     def _apply_caption_cv2(frame_bgr: np.ndarray, text: str) -> np.ndarray:

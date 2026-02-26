@@ -9,6 +9,7 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
+import cv2
 import streamlit as st
 from PIL import Image, ImageOps
 
@@ -27,7 +28,7 @@ from utils.ffmpeg import resolve_ffmpeg_binary
 
 st.set_page_config(
     page_title="AI Growing Up Generator",
-    page_icon="🎬",
+    page_icon="AI",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -42,13 +43,16 @@ div[data-testid="stProgress"] > div { height: 12px; border-radius: 6px; }
 """
 st.markdown(_CSS, unsafe_allow_html=True)
 
-# ── Resolution presets ─────────────────────────────────────────────────
+# â”€â”€ Resolution presets â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 RESOLUTION_MAP = {
     "720p":  (1280, 720),
     "1080p": (1920, 1080),
     "4K":    (3840, 2160),
 }
 MAX_UPLOAD_EDGE = 2048
+MAX_TIMELINE_ITEMS = 120
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+VIDEO_EXTENSIONS = {"mp4", "mov", "m4v", "webm", "avi"}
 TRANSITION_STYLE_OPTIONS = ["Emotional", "Balanced", "Fast"]
 TRANSITION_DURATION_OPTIONS = perceptual_duration_options()
 
@@ -108,6 +112,32 @@ PERFORMANCE_PRESET_ORDER = [
 ]
 
 
+def _upload_ext(filename: str) -> str:
+    return Path(filename).suffix.lower().lstrip(".")
+
+
+def _save_upload_to_temp(uploaded_file, suffix: str) -> str:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    uploaded_file.seek(0)
+    tmp.write(uploaded_file.read())
+    tmp.close()
+    return tmp.name
+
+
+def _load_video_thumbnail(video_path: str) -> Image.Image | None:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    try:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            return None
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(rgb)
+    finally:
+        cap.release()
+
+
 @lru_cache(maxsize=8)
 def _ffmpeg_supports_encoder(encoder_name: str) -> bool:
     try:
@@ -142,7 +172,7 @@ def _nearest_duration_option(value: float) -> float:
 
 
 def _sidebar(state):
-    st.sidebar.header("⚙️ Settings")
+    st.sidebar.header("Settings")
 
     # Resolution selector
     state.resolution = st.sidebar.selectbox(
@@ -182,7 +212,7 @@ def _sidebar(state):
 
     # Performance preset
     st.sidebar.divider()
-    st.sidebar.subheader("⚡ Performance")
+    st.sidebar.subheader("Performance")
     state.performance_mode = st.sidebar.selectbox(
         "Render Preset",
         options=PERFORMANCE_PRESET_ORDER,
@@ -223,7 +253,7 @@ def _sidebar(state):
 
     # Background music upload
     st.sidebar.divider()
-    st.sidebar.subheader("🎵 Background Music")
+    st.sidebar.subheader("Background Music")
     music_file = st.sidebar.file_uploader(
         "Upload MP3 (optional)",
         type=["mp3", "wav", "m4a", "ogg"],
@@ -236,7 +266,7 @@ def _sidebar(state):
         tmp.write(music_bytes)
         tmp.close()
         state.music_path = tmp.name
-        st.sidebar.success(f"✓ {music_file.name}")
+        st.sidebar.success(music_file.name)
     elif not music_file:
         state.music_path = None
 
@@ -259,7 +289,7 @@ def _sidebar(state):
         elif device.type == "mps":
             st.sidebar.info("Apple Silicon (MPS)")
         else:
-            st.sidebar.warning("No GPU — CPU mode (slower)")
+            st.sidebar.warning("No GPU - CPU mode (slower)")
 
         st.sidebar.divider()
         st.sidebar.caption(
@@ -268,7 +298,7 @@ def _sidebar(state):
         )
 
 
-def _run_pipeline(images, captions, config, state):
+def _run_pipeline(media_items, captions, config, state):
     try:
         from pipeline.orchestrator import GrowingUpPipeline
 
@@ -293,7 +323,7 @@ def _run_pipeline(images, captions, config, state):
             transition_duration_seconds=state.transition_duration_seconds,
             fps_output=config.video.fps_output,
             rife_multiplier=config.video.rife_multiplier,
-            num_images=max(2, len(images)),
+            num_images=max(2, len(media_items)),
             turbo_mode=state.turbo_mode,
             output_width=config.video.output_width,
             output_height=config.video.output_height,
@@ -317,16 +347,25 @@ def _run_pipeline(images, captions, config, state):
             state.progress = p
             state.status_message = msg
 
-        if len(images) > 1:
+        all_images = all(str(item.get("kind", "")).lower() == "image" for item in media_items)
+        if all_images and len(media_items) == 1:
+            output_path = pipeline.run(media_items[0]["image"], progress_callback=progress_cb)
+        elif all_images:
             output_path = pipeline.run_multi_image(
-                images,
+                [item["image"] for item in media_items],
                 captions=captions,
                 fade_in_out=state.fade_enabled,
                 music_path=state.music_path,
                 progress_callback=progress_cb,
             )
         else:
-            output_path = pipeline.run(images[0], progress_callback=progress_cb)
+            output_path = pipeline.run_mixed_timeline(
+                media_items=media_items,
+                captions=captions,
+                fade_in_out=state.fade_enabled,
+                music_path=state.music_path,
+                progress_callback=progress_cb,
+            )
 
         state.output_path = str(output_path)
         state.preview_frames = pipeline.stage_previews
@@ -337,7 +376,6 @@ def _run_pipeline(images, captions, config, state):
     finally:
         state.is_processing = False
 
-
 def main():
     config = get_config()
     state = get_state()
@@ -347,8 +385,8 @@ def main():
     st.markdown('<p class="main-title">AI Growing Up Generator</p>', unsafe_allow_html=True)
     st.markdown(
         '<p class="subtitle">'
-        'Upload one photo for AI-generated age progression, '
-        'or multiple photos for authentic chronological transitions.'
+        "Upload one photo for AI age progression, "
+        "or build a timeline from photos and MP4 videos."
         '</p>',
         unsafe_allow_html=True,
     )
@@ -356,109 +394,157 @@ def main():
     col_upload, col_info = st.columns([1, 1], gap="large")
 
     with col_upload:
-        st.subheader("Upload Photos")
-        st.caption("📸 Upload photos in chronological order (youngest → oldest)")
+        st.subheader("Upload Timeline Media")
+        st.caption("Upload in chronological order (youngest -> oldest)")
 
         uploaded_files = st.file_uploader(
-            "Choose clear, frontal face photos",
-            type=["jpg", "jpeg", "png", "webp"],
-            help="Best results: well-lit, no sunglasses, facing camera. Upload in chronological order.",
+            "Choose photos and videos",
+            type=sorted(IMAGE_EXTENSIONS | VIDEO_EXTENSIONS),
+            help="Supported: JPG/PNG/WEBP + MP4/MOV/M4V/WEBM/AVI",
             disabled=state.is_processing,
             accept_multiple_files=True,
         )
 
         if uploaded_files:
+            state.uploaded_media_items = []
             state.uploaded_images = []
             successful_loads = 0
 
-            for idx, uploaded_file in enumerate(uploaded_files[:120]):
+            for idx, uploaded_file in enumerate(uploaded_files[:MAX_TIMELINE_ITEMS]):
                 try:
-                    uploaded_file.seek(0)
-                    file_bytes = io.BytesIO(uploaded_file.read())
-                    image = ImageOps.exif_transpose(Image.open(file_bytes)).convert("RGB")
-                    w, h = image.size
-                    max_edge = max(w, h)
-                    if max_edge > MAX_UPLOAD_EDGE:
-                        scale = MAX_UPLOAD_EDGE / max_edge
-                        image = image.resize(
-                            (max(1, int(w * scale)), max(1, int(h * scale))),
-                            Image.LANCZOS,
+                    ext = _upload_ext(uploaded_file.name)
+                    if ext in IMAGE_EXTENSIONS:
+                        uploaded_file.seek(0)
+                        file_bytes = io.BytesIO(uploaded_file.read())
+                        image = ImageOps.exif_transpose(Image.open(file_bytes)).convert("RGB")
+                        w, h = image.size
+                        max_edge = max(w, h)
+                        if max_edge > MAX_UPLOAD_EDGE:
+                            scale = MAX_UPLOAD_EDGE / max_edge
+                            image = image.resize(
+                                (max(1, int(w * scale)), max(1, int(h * scale))),
+                                Image.LANCZOS,
+                            )
+                        state.uploaded_images.append(image)
+                        state.uploaded_media_items.append(
+                            {
+                                "kind": "image",
+                                "image": image,
+                                "name": uploaded_file.name,
+                            }
                         )
-                    state.uploaded_images.append(image)
-                    successful_loads += 1
-                except (Image.UnidentifiedImageError, IOError) as e:
-                    st.error(f"❌ Could not load image {idx + 1} ({uploaded_file.name}): {e}")
-                except Exception as e:
-                    st.error(f"❌ Unexpected error with image {idx + 1}: {e}")
-
-            if state.uploaded_images:
-                state.uploaded_image = state.uploaded_images[0]
-                st.success(f"✅ Loaded {successful_loads} photo(s)")
-
-                num = len(state.uploaded_images)
-
-                # ── Image reorder + captions section ──────────────
-                if num > 1:
-                    st.markdown("**📋 Image Order & Captions**")
-                    st.caption("Change the number in 'Order' to rearrange. Add optional captions.")
-
-                    # Ensure captions list matches
-                    while len(state.image_captions) < num:
-                        state.image_captions.append("")
-                    state.image_captions = state.image_captions[:num]
-
-                    new_order = [None] * num
-                    new_captions = [""] * num
-
-                    cols_per_row = min(num, 4)
-                    for row_start in range(0, num, cols_per_row):
-                        row_end = min(row_start + cols_per_row, num)
-                        cols = st.columns(cols_per_row)
-                        for ci, i in enumerate(range(row_start, row_end)):
-                            with cols[ci]:
-                                st.image(state.uploaded_images[i], use_column_width=True)
-                                pos = st.number_input(
-                                    "Order",
-                                    min_value=1, max_value=num,
-                                    value=i + 1,
-                                    key=f"order_{i}",
-                                    disabled=state.is_processing,
-                                )
-                                cap = st.text_input(
-                                    "Caption",
-                                    value=state.image_captions[i],
-                                    placeholder=f"e.g. Age 3, Bar Mitzvah…",
-                                    key=f"cap_{i}",
-                                    disabled=state.is_processing,
-                                )
-                                new_order[i] = pos - 1
-                                new_captions[i] = cap
-
-                    # Validate no duplicate orders
-                    if len(set(new_order)) == num:
-                        sorted_indices = sorted(range(num), key=lambda x: new_order[x])
-                        state.uploaded_images = [state.uploaded_images[j] for j in sorted_indices]
-                        state.image_captions = [new_captions[j] for j in sorted_indices]
+                    elif ext in VIDEO_EXTENSIONS:
+                        temp_path = _save_upload_to_temp(uploaded_file, suffix=f".{ext or 'mp4'}")
+                        thumb = _load_video_thumbnail(temp_path)
+                        if thumb is None:
+                            raise ValueError("Could not decode video")
+                        state.uploaded_media_items.append(
+                            {
+                                "kind": "video",
+                                "video_path": temp_path,
+                                "thumbnail": thumb,
+                                "name": uploaded_file.name,
+                            }
+                        )
                     else:
-                        st.warning("⚠️ Duplicate order numbers — fix to reorder")
-                        state.image_captions = new_captions
+                        raise ValueError(f"Unsupported file type: {ext}")
+                    successful_loads += 1
+                except Exception as e:
+                    st.error(f"Could not load file {idx + 1} ({uploaded_file.name}): {e}")
 
+            if state.uploaded_media_items:
+                state.uploaded_image = next(
+                    (item["image"] for item in state.uploaded_media_items if item["kind"] == "image"),
+                    None,
+                )
+                st.success(f"Loaded {successful_loads} timeline item(s)")
+
+                num = len(state.uploaded_media_items)
+                while len(state.image_captions) < num:
+                    state.image_captions.append("")
+                state.image_captions = state.image_captions[:num]
+                while len(state.image_text_overlays) < num:
+                    state.image_text_overlays.append("")
+                state.image_text_overlays = state.image_text_overlays[:num]
+
+                st.markdown("**Timeline Order + Captions/Text**")
+                st.caption("Caption appears on screen. If Caption is empty, Text is used.")
+
+                new_order = [None] * num
+                new_captions = [""] * num
+                new_texts = [""] * num
+
+                cols_per_row = min(num, 4)
+                for row_start in range(0, num, cols_per_row):
+                    row_end = min(row_start + cols_per_row, num)
+                    cols = st.columns(cols_per_row)
+                    for ci, i in enumerate(range(row_start, row_end)):
+                        with cols[ci]:
+                            item = state.uploaded_media_items[i]
+                            if item["kind"] == "image":
+                                st.image(item["image"], use_column_width=True)
+                                st.caption("Image")
+                            else:
+                                st.image(item["thumbnail"], use_column_width=True)
+                                st.caption(f"Video: {item['name']}")
+
+                            pos = st.number_input(
+                                "Order",
+                                min_value=1,
+                                max_value=num,
+                                value=i + 1,
+                                key=f"order_{i}",
+                                disabled=state.is_processing,
+                            )
+                            cap = st.text_input(
+                                "Caption",
+                                value=state.image_captions[i],
+                                placeholder="e.g. Age 3, Bar Mitzvah...",
+                                key=f"cap_{i}",
+                                disabled=state.is_processing,
+                            )
+                            txt = st.text_input(
+                                "Text",
+                                value=state.image_text_overlays[i],
+                                placeholder="Optional fallback text",
+                                key=f"text_{i}",
+                                disabled=state.is_processing,
+                            )
+                            new_order[i] = pos - 1
+                            new_captions[i] = cap
+                            new_texts[i] = txt
+
+                if len(set(new_order)) == num:
+                    sorted_indices = sorted(range(num), key=lambda x: new_order[x])
+                    state.uploaded_media_items = [state.uploaded_media_items[j] for j in sorted_indices]
+                    state.image_captions = [new_captions[j] for j in sorted_indices]
+                    state.image_text_overlays = [new_texts[j] for j in sorted_indices]
                 else:
-                    st.image(state.uploaded_images[0], caption="Uploaded photo", use_column_width=True)
-                    state.image_captions = [""]
+                    st.warning("Duplicate order numbers detected. Fix them to reorder.")
+                    state.image_captions = new_captions
+                    state.image_text_overlays = new_texts
 
-                # Resolution info
-                W, H = state.uploaded_images[0].size
-                if W < 256 or H < 256:
-                    st.warning("⚠️ Low resolution — results may lack detail.")
-                elif W >= 512 and H >= 512:
-                    st.success(f"✓ Good resolution: {W}×{H}")
+                state.uploaded_images = [
+                    item["image"] for item in state.uploaded_media_items if item["kind"] == "image"
+                ]
+                lead_image = next(
+                    (item["image"] for item in state.uploaded_media_items if item["kind"] == "image"),
+                    None,
+                )
+                if lead_image is not None:
+                    w, h = lead_image.size
+                    if w < 256 or h < 256:
+                        st.warning("Low-resolution image detected; quality may drop.")
+                    elif w >= 512 and h >= 512:
+                        st.success(f"Good image resolution: {w}x{h}")
 
     with col_info:
-        num_images = len(state.uploaded_images)
+        num_items = len(state.uploaded_media_items)
+        num_images = sum(1 for item in state.uploaded_media_items if item["kind"] == "image")
+        num_videos = sum(1 for item in state.uploaded_media_items if item["kind"] == "video")
         res_w, res_h = RESOLUTION_MAP[state.resolution]
 
-        if num_images == 0:
+        if num_items == 0:
             st.subheader("How It Works")
             st.markdown("""
             **Option 1: Single Photo (AI Generation)**
@@ -466,22 +552,23 @@ def main():
             - AI generates age progression stages
             - Creates cinematic aging video
 
-            **Option 2: Multiple Photos (Authentic)**
-            - Upload 2-120 photos in chronological order
-            - Creates smooth transitions between your real photos
-            - More authentic and personal result
+            **Option 2: Timeline (Photos + Videos)**
+            - Upload photos and MP4/MOV clips in order
+            - Videos are played directly in the timeline
+            - Transitions connect from each item end to the next item start
             """)
-        elif num_images == 1:
+        elif num_items == 1 and num_videos == 0:
             st.subheader("Age Progression Stages")
             ages = config.pipeline.age_stages
             st.write("  ".join([f"**{a}y**" for a in ages]))
             st.caption("AI will generate these age stages from your photo")
         else:
-            st.subheader(f"Video from {num_images} Photos")
+            st.subheader(f"Timeline: {num_items} Item(s)")
             c1, c2, c3 = st.columns(3)
-            c1.metric("Transitions", f"{num_images - 1}")
+            c1.metric("Transitions", f"{max(0, num_items - 1)}")
             c2.metric("Style", state.transition_style)
             c3.metric("Duration", f"{state.transition_duration_seconds:.2f}s")
+            st.caption(f"Media mix: {num_images} image(s), {num_videos} video(s)")
             preset = PERFORMANCE_PRESETS[state.performance_mode]
             profile = compute_transition_plan(
                 transition_style=state.transition_style,
@@ -489,7 +576,7 @@ def main():
                 fps_output=config.video.fps_output,
                 rife_multiplier=max(1, int(preset["rife_multiplier"])),
                 turbo_mode=state.turbo_mode,
-                num_images=max(2, num_images),
+                num_images=max(2, num_items),
                 output_width=res_w,
                 output_height=res_h,
             )
@@ -507,35 +594,39 @@ def main():
                     f"workers {int(state.transition_process_workers)}, "
                     f"chunked={'on' if state.chunked_parallel else 'off'}"
                 )
-            st.success(f"Smooth transitions between your {num_images} photos")
+            st.success("Smooth transitions between timeline items")
 
         st.subheader("Output Spec")
         c1, c2, c3 = st.columns(3)
-        c1.metric("Resolution", f"{res_w}×{res_h}")
+        c1.metric("Resolution", f"{res_w}x{res_h}")
         c2.metric("Frame Rate", "60 fps")
         c3.metric("Format", "H.264 MP4")
 
+        overlay_texts = [
+            (cap or "").strip() or (txt or "").strip()
+            for cap, txt in zip(state.image_captions, state.image_text_overlays)
+        ]
         extras = []
         if state.fade_enabled:
-            extras.append("🌑 Fade In/Out")
+            extras.append("Fade In/Out")
         if state.music_path:
-            extras.append("🎵 Music")
-        if any(c.strip() for c in state.image_captions):
-            extras.append("📝 Captions")
+            extras.append("Music")
+        if any(t for t in overlay_texts):
+            extras.append("Text Overlay")
         if extras:
-            st.info("Features: " + " · ".join(extras))
+            st.info("Features: " + " | ".join(extras))
 
         st.subheader("Pipeline")
-        if num_images > 1:
+        if num_items > 1 or num_videos > 0:
             steps = [
-                "Face detection & alignment",
+                "Timeline media normalization",
                 "Landmark extraction",
-                "Low-res Delaunay morphing (fast)",
-                "RIFE 4× frame interpolation (GPU)",
+                "Delaunay morphing for transitions",
+                "RIFE interpolation (if enabled)",
                 "Upscale to output resolution",
                 "Ken Burns cinematic zoom",
             ]
-            if any(c.strip() for c in state.image_captions):
+            if any(t for t in overlay_texts):
                 steps.append("Text caption overlay")
             if state.fade_enabled:
                 steps.append("Fade in / fade out")
@@ -549,7 +640,7 @@ def main():
                 "SDXL age-stage generation",
                 "GFPGAN face refinement",
                 "Delaunay landmark morphing",
-                "RIFE 4× frame interpolation",
+                "RIFE frame interpolation",
                 "Ken Burns cinematic zoom",
                 "FFmpeg encoding",
             ]
@@ -558,17 +649,42 @@ def main():
 
     st.divider()
 
-    generate_disabled = not state.uploaded_images or state.is_processing
+    generate_disabled = not state.uploaded_media_items or state.is_processing
+    only_single_image = (
+        len(state.uploaded_media_items) == 1 and
+        state.uploaded_media_items[0]["kind"] == "image"
+    )
 
     if st.button(
-        "🎬 Generate Growing Up Video" if len(state.uploaded_images) <= 1
-        else f"🎬 Generate Video from {len(state.uploaded_images)} Photos",
+        "Generate Growing Up Video" if only_single_image
+        else f"Generate Timeline Video ({len(state.uploaded_media_items)} items)",
         disabled=generate_disabled,
         type="primary",
         use_container_width=True,
     ):
-        images_to_process = state.uploaded_images.copy()
-        captions_to_process = state.image_captions.copy()
+        media_to_process = []
+        for item in state.uploaded_media_items:
+            if item["kind"] == "image":
+                media_to_process.append(
+                    {
+                        "kind": "image",
+                        "image": item["image"],
+                        "name": item.get("name", "image"),
+                    }
+                )
+            else:
+                media_to_process.append(
+                    {
+                        "kind": "video",
+                        "video_path": item["video_path"],
+                        "name": item.get("name", "video"),
+                    }
+                )
+
+        captions_to_process = [
+            (cap or "").strip() or (txt or "").strip()
+            for cap, txt in zip(state.image_captions, state.image_text_overlays)
+        ]
         saved_resolution = state.resolution
         saved_style = state.transition_style
         saved_duration = state.transition_duration_seconds
@@ -583,10 +699,12 @@ def main():
         state = get_state()
         state.is_processing = True
         state.progress = 0.0
-        state.status_message = "Starting pipeline…"
-        state.uploaded_images = images_to_process
-        state.uploaded_image = images_to_process[0] if images_to_process else None
+        state.status_message = "Starting pipeline..."
+        state.uploaded_media_items = media_to_process
+        state.uploaded_images = [item["image"] for item in media_to_process if item["kind"] == "image"]
+        state.uploaded_image = state.uploaded_images[0] if state.uploaded_images else None
         state.image_captions = captions_to_process
+        state.image_text_overlays = [""] * len(captions_to_process)
         state.resolution = saved_resolution
         state.transition_style = saved_style
         state.transition_duration_seconds = saved_duration
@@ -599,13 +717,13 @@ def main():
 
         thread = threading.Thread(
             target=_run_pipeline,
-            args=(images_to_process, captions_to_process, config, state),
+            args=(media_to_process, captions_to_process, config, state),
             daemon=True,
         )
         thread.start()
 
     if state.is_processing:
-        st.subheader("Generating…")
+        st.subheader("Generating...")
         st.progress(state.progress)
         st.info(state.status_message)
         time.sleep(2)
