@@ -115,6 +115,15 @@ PERFORMANCE_PRESET_ORDER = [
 ]
 
 
+def _available_cpu_count() -> int:
+    try:
+        if hasattr(os, "sched_getaffinity"):
+            return max(1, len(os.sched_getaffinity(0)))
+    except Exception:
+        pass
+    return max(1, int(os.cpu_count() or 1))
+
+
 def _upload_ext(filename: str) -> str:
     return Path(filename).suffix.lower().lstrip(".")
 
@@ -301,7 +310,7 @@ def _sidebar(state):
         options=PERFORMANCE_PRESET_ORDER,
         index=PERFORMANCE_PRESET_ORDER.index(state.performance_mode)
         if state.performance_mode in PERFORMANCE_PRESET_ORDER
-        else 1,
+        else 0,
         help="Fast = quick preview. Quality = best detail, slower render.",
         disabled=state.is_processing,
     )
@@ -311,12 +320,15 @@ def _sidebar(state):
         help="Aggressively reduces morph workload for much faster renders.",
         disabled=state.is_processing,
     )
+    cpu_budget = _available_cpu_count()
+    max_worker_ui = max(1, min(16, cpu_budget))
+    worker_value = max(1, min(int(state.transition_process_workers), max_worker_ui))
     state.transition_process_workers = st.sidebar.slider(
         "Transition Workers (Processes)",
         min_value=1,
-        max_value=3,
-        value=int(state.transition_process_workers),
-        help="Parallel CPU transition generation. 3 is best for large albums.",
+        max_value=max_worker_ui,
+        value=worker_value,
+        help=f"Parallel transition generation. Container CPU budget detected: {cpu_budget}.",
         disabled=state.is_processing,
     )
     state.chunked_parallel = st.sidebar.checkbox(
@@ -328,23 +340,11 @@ def _sidebar(state):
     state.transition_chunk_size = st.sidebar.slider(
         "Chunk Size (transitions)",
         min_value=1,
-        max_value=6,
-        value=int(state.transition_chunk_size),
+        max_value=12,
+        value=max(1, min(int(state.transition_chunk_size), 12)),
         help="How many transitions each process computes per chunk.",
         disabled=state.is_processing or not state.chunked_parallel,
     )
-    state.video_slow_motion_factor = float(
-        st.sidebar.slider(
-            "Video Slow Motion",
-            min_value=1.0,
-            max_value=2.5,
-            value=float(state.video_slow_motion_factor),
-            step=0.1,
-            help="Applies only to uploaded video items in Timeline mode.",
-            disabled=state.is_processing,
-        )
-    )
-
     # Background music upload
     st.sidebar.divider()
     st.sidebar.subheader("Background Music")
@@ -458,7 +458,6 @@ def _run_pipeline(media_items, captions, config, state):
                 captions=captions,
                 fade_in_out=state.fade_enabled,
                 music_path=state.music_path,
-                video_slow_motion_factor=state.video_slow_motion_factor,
                 progress_callback=progress_cb,
             )
 
@@ -561,6 +560,12 @@ def main():
                 while len(state.image_text_overlays) < num:
                     state.image_text_overlays.append("")
                 state.image_text_overlays = state.image_text_overlays[:num]
+                while len(state.timeline_video_slow_factors) < num:
+                    state.timeline_video_slow_factors.append(1.0)
+                state.timeline_video_slow_factors = state.timeline_video_slow_factors[:num]
+                for i, item in enumerate(state.uploaded_media_items):
+                    if item["kind"] != "video":
+                        state.timeline_video_slow_factors[i] = 1.0
 
                 st.markdown("**Timeline Order + Captions/Text**")
                 st.caption("Caption appears on screen. If Caption is empty, Text is used.")
@@ -568,6 +573,7 @@ def main():
                 new_order = [None] * num
                 new_captions = [""] * num
                 new_texts = [""] * num
+                new_slow_factors = [1.0] * num
 
                 cols_per_row = min(num, 4)
                 for row_start in range(0, num, cols_per_row):
@@ -579,9 +585,21 @@ def main():
                             if item["kind"] == "image":
                                 st.image(item["image"], use_column_width=True)
                                 st.caption("Image")
+                                slow_factor = 1.0
                             else:
                                 st.image(item["thumbnail"], use_column_width=True)
                                 st.caption(f"Video: {item['name']}")
+                                slow_factor = float(
+                                    st.slider(
+                                        "Video Slow Motion",
+                                        min_value=1.0,
+                                        max_value=10.0,
+                                        value=float(state.timeline_video_slow_factors[i]),
+                                        step=0.1,
+                                        key=f"video_slow_{i}",
+                                        disabled=state.is_processing,
+                                    )
+                                )
 
                             pos = st.number_input(
                                 "Order",
@@ -608,16 +626,19 @@ def main():
                             new_order[i] = pos - 1
                             new_captions[i] = cap
                             new_texts[i] = txt
+                            new_slow_factors[i] = slow_factor
 
                 if len(set(new_order)) == num:
                     sorted_indices = sorted(range(num), key=lambda x: new_order[x])
                     state.uploaded_media_items = [state.uploaded_media_items[j] for j in sorted_indices]
                     state.image_captions = [new_captions[j] for j in sorted_indices]
                     state.image_text_overlays = [new_texts[j] for j in sorted_indices]
+                    state.timeline_video_slow_factors = [new_slow_factors[j] for j in sorted_indices]
                 else:
                     st.warning("Duplicate order numbers detected. Fix them to reorder.")
                     state.image_captions = new_captions
                     state.image_text_overlays = new_texts
+                    state.timeline_video_slow_factors = new_slow_factors
 
                 state.uploaded_images = [
                     item["image"] for item in state.uploaded_media_items if item["kind"] == "image"
@@ -637,6 +658,15 @@ def main():
         num_items = len(state.uploaded_media_items)
         num_images = sum(1 for item in state.uploaded_media_items if item["kind"] == "image")
         num_videos = sum(1 for item in state.uploaded_media_items if item["kind"] == "video")
+        slow_video_factors = [
+            float(state.timeline_video_slow_factors[i])
+            for i, item in enumerate(state.uploaded_media_items)
+            if (
+                item["kind"] == "video"
+                and i < len(state.timeline_video_slow_factors)
+            )
+        ]
+        slow_videos = [f for f in slow_video_factors if f > 1.0]
         res_w, res_h = RESOLUTION_MAP[state.resolution]
 
         if num_items == 0:
@@ -664,8 +694,8 @@ def main():
             c2.metric("Style", state.transition_style)
             c3.metric("Duration", f"{state.transition_duration_seconds:.2f}s")
             st.caption(f"Media mix: {num_images} image(s), {num_videos} video(s)")
-            if num_videos > 0 and state.video_slow_motion_factor > 1.0:
-                st.caption(f"Video slow motion: {state.video_slow_motion_factor:.1f}x")
+            if slow_videos:
+                st.caption(f"Video slow motion: {len(slow_videos)} clip(s), up to {max(slow_videos):.1f}x")
             preset = PERFORMANCE_PRESETS[state.performance_mode]
             profile = compute_transition_plan(
                 transition_style=state.transition_style,
@@ -708,8 +738,8 @@ def main():
             extras.append("Fade In/Out")
         if state.music_path:
             extras.append("Music")
-        if num_videos > 0 and state.video_slow_motion_factor > 1.0:
-            extras.append(f"Video Slow {state.video_slow_motion_factor:.1f}x")
+        if slow_videos:
+            extras.append(f"Video Slow x{max(slow_videos):.1f}")
         if any(t for t in overlay_texts):
             extras.append("Text Overlay")
         if extras:
@@ -762,7 +792,12 @@ def main():
         use_container_width=True,
     ):
         media_to_process = []
-        for item in state.uploaded_media_items:
+        for i, item in enumerate(state.uploaded_media_items):
+            slow_factor = (
+                float(state.timeline_video_slow_factors[i])
+                if i < len(state.timeline_video_slow_factors)
+                else 1.0
+            )
             if item["kind"] == "image":
                 media_to_process.append(
                     {
@@ -777,6 +812,7 @@ def main():
                         "kind": "video",
                         "video_path": item["video_path"],
                         "name": item.get("name", "video"),
+                        "slow_motion_factor": max(1.0, slow_factor),
                     }
                 )
 
@@ -793,7 +829,7 @@ def main():
         saved_fade = state.fade_enabled
         saved_music = state.music_path
         saved_turbo = state.turbo_mode
-        saved_video_slow = state.video_slow_motion_factor
+        saved_video_slow_factors = list(state.timeline_video_slow_factors)
 
         reset_state()
         state = get_state()
@@ -814,7 +850,7 @@ def main():
         state.fade_enabled = saved_fade
         state.music_path = saved_music
         state.turbo_mode = saved_turbo
-        state.video_slow_motion_factor = saved_video_slow
+        state.timeline_video_slow_factors = saved_video_slow_factors
 
         thread = threading.Thread(
             target=_run_pipeline,

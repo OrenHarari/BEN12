@@ -46,6 +46,9 @@ def _generate_transition_keyframes_worker(
     """
     Process-safe worker for one transition morph sequence.
     """
+    # Prevent CPU over-subscription when running multiple worker processes.
+    cv2.setNumThreads(1)
+
     if not alpha_schedule:
         return [src]
 
@@ -120,10 +123,11 @@ class GrowingUpPipeline:
         self.device = DeviceManager.get_device()
         self.job_id = uuid.uuid4().hex[:8]
         self.stage_previews: list[tuple[int, Image.Image]] = []
-        self.cpu_workers = max(2, min(8, (os.cpu_count() or 4) // 2))
+        self.cpu_workers = max(2, min(12, self._available_cpu_count()))
         self.last_stage_timings: dict[str, float] = {}
+        self._rtl_direction_supported: bool | None = None
         cv2.setUseOptimized(True)
-        cv2.setNumThreads(max(1, self.cpu_workers))
+        cv2.setNumThreads(max(1, min(8, self.cpu_workers)))
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -485,11 +489,25 @@ class GrowingUpPipeline:
         t_encode = perf_counter()
 
         try:
-            process_workers = max(1, int(cfg.pipeline.transition_process_workers))
-            use_process_pool = process_workers > 1 and n_trans >= (process_workers + 1)
+            cpu_budget = self._available_cpu_count()
+            max_process_workers = max(1, min(12, cpu_budget))
+            process_workers = max(
+                1,
+                min(int(cfg.pipeline.transition_process_workers), max_process_workers, max(1, n_trans)),
+            )
+            pixels_per_transition = int(morph_w * morph_h * keyframes_per_transition)
+            heavy_transition_job = (
+                n_trans >= 6
+                or (n_trans >= 4 and pixels_per_transition >= (512 * 512 * 18))
+            )
+            use_process_pool = process_workers > 1 and heavy_transition_job
             chunked_parallel = bool(cfg.pipeline.enable_chunked_parallel) and use_process_pool
-            chunk_size = max(1, int(cfg.pipeline.transition_chunk_size))
+            chunk_size = max(1, min(int(cfg.pipeline.transition_chunk_size), max(1, n_trans)))
             stage_times["process_workers"] = float(process_workers)
+            stage_times["cpu_budget"] = float(cpu_budget)
+            stage_times["max_process_workers"] = float(max_process_workers)
+            stage_times["heavy_transition_job"] = 1.0 if heavy_transition_job else 0.0
+            stage_times["pixels_per_transition"] = float(pixels_per_transition)
             stage_times["multiprocess_mode"] = 1.0 if use_process_pool else 0.0
             stage_times["chunked_parallel"] = 1.0 if chunked_parallel else 0.0
             stage_times["chunk_size"] = float(chunk_size)
@@ -525,7 +543,7 @@ class GrowingUpPipeline:
                         next_chunk_start = end
                         in_flight += 1
                 else:
-                    prefetch = min(n_trans, process_workers * 2)
+                    prefetch = min(n_trans, process_workers * 3)
                     for idx in range(prefetch):
                         pending_frames[idx] = process_pool.submit(
                             _generate_transition_keyframes_worker,
@@ -734,6 +752,7 @@ class GrowingUpPipeline:
           - Video items are rendered directly in sequence.
           - Transitions morph from item-end to next item-start.
           - Caption overlay is applied per item/transition.
+          - Each video item may provide its own slow-motion factor.
         """
         cfg = self.config
         vc = cfg.video
@@ -798,6 +817,15 @@ class GrowingUpPipeline:
                 video_path = item.get("video_path")
                 if not video_path:
                     raise ValueError(f"Timeline item {idx + 1} is missing video_path")
+                item_slow_factor = float(
+                    max(
+                        1.0,
+                        item.get(
+                            "slow_motion_factor",
+                            item.get("video_slow_motion_factor", video_slow_motion_factor),
+                        ),
+                    )
+                )
                 frames = self._decode_video_frames(
                     video_path=Path(str(video_path)),
                     out_w=out_w,
@@ -806,7 +834,7 @@ class GrowingUpPipeline:
                     morph_h=morph_h,
                     target_fps=vc.fps_output,
                     max_seconds=float(getattr(cfg.pipeline, "max_video_clip_seconds", 12.0)),
-                    slow_motion_factor=float(max(1.0, video_slow_motion_factor)),
+                    slow_motion_factor=item_slow_factor,
                 )
                 preview_rgb = cv2.cvtColor(frames[0], cv2.COLOR_BGR2RGB)
                 self.stage_previews.append((idx, Image.fromarray(preview_rgb).resize((128, 128), Image.LANCZOS)))
@@ -814,6 +842,7 @@ class GrowingUpPipeline:
                     {
                         "kind": "video",
                         "name": str(item.get("name", f"video_{idx + 1}")),
+                        "slow_motion_factor": item_slow_factor,
                         "frames": frames,
                         "start_frame": frames[0],
                         "end_frame": frames[-1],
@@ -1057,11 +1086,15 @@ class GrowingUpPipeline:
             raise ValueError(f"Video has no readable frames: {video_path}")
 
         duration_sec = len(raw_frames) / max(src_fps, 1.0)
-        target_count = int(round(duration_sec * max(1, target_fps) * max(1.0, slow_motion_factor)))
-        target_count = max(1, min(target_count, int(max(1.0, max_seconds) * max(1, target_fps))))
-        if target_count >= len(raw_frames):
+        slow_factor = float(max(1.0, slow_motion_factor))
+        target_count = int(round(duration_sec * max(1, target_fps) * slow_factor))
+        # Keep the same safety policy, but scale the cap by slow-motion factor.
+        max_target = int(round(max(1.0, max_seconds) * max(1, target_fps) * slow_factor))
+        target_count = max(1, min(target_count, max_target))
+        if target_count == len(raw_frames):
             return raw_frames
 
+        # Works for both downsample and upsample; upsample repeats nearest frames (slower playback).
         idxs = np.linspace(0, len(raw_frames) - 1, num=target_count).round().astype(np.int32)
         return [raw_frames[int(i)] for i in idxs]
 
@@ -1139,7 +1172,7 @@ class GrowingUpPipeline:
 
     def _apply_caption_cv2(self, frame_bgr: np.ndarray, text: str) -> np.ndarray:
         """
-        Overlay text caption at the bottom of the frame using OpenCV only.
+        Overlay text caption at the bottom with PIL font rendering.
 
         No PIL conversion round-trip — about 10× faster than the PIL path.
         """
@@ -1153,15 +1186,38 @@ class GrowingUpPipeline:
 
         font_size = max(24, int(h / 24))
         font = self._load_caption_font(font_size)
-        text_render = self._prepare_caption_text(text)
+        rtl_direction_supported = self._is_rtl_text(text) and self._rtl_direction_is_supported(draw, font)
+        text_render = self._prepare_caption_text_for_render(text, use_rtl_direction=rtl_direction_supported)
+        text_kwargs: dict = {}
+        if rtl_direction_supported:
+            text_kwargs["direction"] = "rtl"
         try:
-            bbox = draw.textbbox((0, 0), text_render, font=font)
+            bbox = draw.textbbox((0, 0), text_render, font=font, **text_kwargs)
             tw = max(1, int(bbox[2] - bbox[0]))
             th = max(1, int(bbox[3] - bbox[1]))
         except Exception:
-            tw, th = draw.textsize(text_render, font=font)  # type: ignore[attr-defined]
-            tw = max(1, int(tw))
-            th = max(1, int(th))
+            try:
+                # Retry without bidi kwargs (e.g. no libraqm support).
+                bbox = draw.textbbox((0, 0), text_render, font=font)
+                tw = max(1, int(bbox[2] - bbox[0]))
+                th = max(1, int(bbox[3] - bbox[1]))
+                text_kwargs = {}
+            except Exception:
+                try:
+                    # Pillow font-level fallback for older APIs.
+                    bbox = font.getbbox(text_render)
+                    tw = max(1, int(bbox[2] - bbox[0]))
+                    th = max(1, int(bbox[3] - bbox[1]))
+                    text_kwargs = {}
+                except Exception:
+                    try:
+                        tw, th = font.getsize(text_render)  # type: ignore[attr-defined]
+                        tw = max(1, int(tw))
+                        th = max(1, int(th))
+                    except Exception:
+                        tw = max(1, int(draw.textlength(text_render, font=font)))
+                        th = max(1, int(getattr(font, "size", max(24, int(h / 24)))))
+                    text_kwargs = {}
 
         tx = max(10, (w - tw) // 2)
         ty = max(10, h - max(48, h // 14) - th)
@@ -1171,7 +1227,10 @@ class GrowingUpPipeline:
             [(tx - pad_x, ty - pad_y), (tx + tw + pad_x, ty + th + pad_y)],
             fill=(0, 0, 0, 150),
         )
-        draw.text((tx, ty), text_render, font=font, fill=(255, 255, 255, 255))
+        try:
+            draw.text((tx, ty), text_render, font=font, fill=(255, 255, 255, 255), **text_kwargs)
+        except Exception:
+            draw.text((tx, ty), text_render, font=font, fill=(255, 255, 255, 255))
 
         composed = Image.alpha_composite(base, overlay).convert("RGB")
         return cv2.cvtColor(np.array(composed), cv2.COLOR_RGB2BGR)
@@ -1181,12 +1240,44 @@ class GrowingUpPipeline:
         cleaned = (text or "").strip()
         if not cleaned:
             return ""
-        try:
-            from bidi.algorithm import get_display  # type: ignore
+        return cleaned
 
-            return get_display(cleaned)
+    def _rtl_direction_is_supported(self, draw: ImageDraw.ImageDraw, font: ImageFont.ImageFont) -> bool:
+        if self._rtl_direction_supported is not None:
+            return self._rtl_direction_supported
+        try:
+            draw.textbbox((0, 0), "\u05d0\u05d1", font=font, direction="rtl")
+            self._rtl_direction_supported = True
         except Exception:
-            return cleaned
+            self._rtl_direction_supported = False
+        return self._rtl_direction_supported
+
+    def _prepare_caption_text_for_render(self, text: str, use_rtl_direction: bool) -> str:
+        cleaned = self._prepare_caption_text(text)
+        if not cleaned:
+            return ""
+        # If RTL layout is unavailable (no libraqm), pre-shape visual order via bidi.
+        if self._is_rtl_text(cleaned) and not use_rtl_direction:
+            try:
+                from bidi.algorithm import get_display  # type: ignore
+
+                return get_display(cleaned)
+            except Exception:
+                return cleaned[::-1]
+        return cleaned
+
+    @staticmethod
+    def _is_rtl_text(text: str) -> bool:
+        for ch in text:
+            code = ord(ch)
+            if (
+                0x0590 <= code <= 0x05FF  # Hebrew
+                or 0x0600 <= code <= 0x06FF  # Arabic
+                or 0x0750 <= code <= 0x077F  # Arabic Supplement
+                or 0x08A0 <= code <= 0x08FF  # Arabic Extended-A
+            ):
+                return True
+        return False
 
     @staticmethod
     def _load_caption_font(font_size: int) -> ImageFont.ImageFont:
@@ -1207,6 +1298,15 @@ class GrowingUpPipeline:
             except Exception:
                 continue
         return ImageFont.load_default()
+
+    @staticmethod
+    def _available_cpu_count() -> int:
+        try:
+            if hasattr(os, "sched_getaffinity"):
+                return max(1, len(os.sched_getaffinity(0)))
+        except Exception:
+            pass
+        return max(1, int(os.cpu_count() or 1))
 
     @staticmethod
     def _style_ease(t: float, style: str) -> float:
