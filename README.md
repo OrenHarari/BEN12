@@ -53,13 +53,54 @@ This downloads:
 
 InsightFace `buffalo_l` and all SDXL/diffusers models download automatically on first run.
 
-### 3. Launch the UI
+### 3. Launch the AI Growing Up Generator
 
 ```bash
 streamlit run app/main.py
 ```
 
-Open http://localhost:8501 in your browser.
+---
+
+## AI Growing Up Generator Architecture
+
+### Components
+
+- `app/main.py` — Streamlit UI entry point
+- `app/config.py` — centralized runtime configuration
+- `pipeline/orchestrator.py` — render pipeline coordinator
+- `modules/*` — generation, morphing, interpolation, and video processing building blocks
+
+### Web UI Features
+
+- Upload child image
+- Upload celebrity image (optional)
+- Mode selector:
+    - Age Progression Video
+    - Child + Celebrity Scene
+    - Full Movie
+- Text prompt
+- Generate button
+- Progress indicator
+- Video preview output
+
+### FastAPI Endpoints
+
+- `POST /jobs` — submit job
+- `GET /jobs/{job_id}` — check status/progress
+- `GET /jobs/{job_id}/download` — download rendered MP4
+- `POST /jobs/{job_id}/cancel` — request cancel
+- `POST /jobs/{job_id}/retry` — retry failed/completed job (up to max retries)
+
+### Full Movie Input
+
+For `Full Movie`, provide a JSON scene list in the UI, for example:
+
+```json
+[
+    {"title": "School Day", "prompt": "walking to school in morning light", "duration_seconds": 2.5},
+    {"title": "Stage Performance", "prompt": "performing on stage", "duration_seconds": 2.5}
+]
+```
 
 ---
 
