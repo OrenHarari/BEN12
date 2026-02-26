@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import io
+import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -124,14 +127,94 @@ def _save_upload_to_temp(uploaded_file, suffix: str) -> str:
     return tmp.name
 
 
+def _resolve_ffprobe_binary() -> str | None:
+    env = os.environ.get("FFPROBE_BINARY")
+    if env:
+        return env
+    probe = shutil.which("ffprobe")
+    if probe:
+        return probe
+    try:
+        ffmpeg_bin = resolve_ffmpeg_binary()
+        candidate = Path(ffmpeg_bin).with_name("ffprobe")
+        if candidate.exists():
+            return str(candidate)
+    except Exception:
+        return None
+    return None
+
+
+def _read_video_rotation_degrees(video_path: str) -> int:
+    ffprobe_bin = _resolve_ffprobe_binary()
+    if ffprobe_bin is None:
+        return 0
+    cmd = [
+        ffprobe_bin,
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream_tags=rotate:stream_side_data=rotation",
+        "-of", "json",
+        video_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=8)
+        if result.returncode != 0 or not result.stdout.strip():
+            return 0
+        payload = json.loads(result.stdout)
+        streams = payload.get("streams") or []
+        if not streams:
+            return 0
+        stream = streams[0]
+        rotation_val = None
+        tags = stream.get("tags") or {}
+        if "rotate" in tags:
+            rotation_val = tags.get("rotate")
+        side_data = stream.get("side_data_list") or stream.get("side_data") or []
+        if isinstance(side_data, list):
+            for entry in side_data:
+                if isinstance(entry, dict) and "rotation" in entry:
+                    rotation_val = entry.get("rotation")
+                    break
+        if rotation_val is None:
+            return 0
+        degrees = int(round(float(rotation_val))) % 360
+        snapped = min((0, 90, 180, 270), key=lambda d: abs(d - degrees))
+        return int(snapped)
+    except Exception:
+        return 0
+
+
+def _rotate_frame_bgr(frame, rotation_deg: int):
+    if rotation_deg == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if rotation_deg == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if rotation_deg == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
+
+
 def _load_video_thumbnail(video_path: str) -> Image.Image | None:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return None
     try:
+        if hasattr(cv2, "CAP_PROP_ORIENTATION_AUTO"):
+            cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
+        rotation_deg = _read_video_rotation_degrees(video_path)
+        if rotation_deg == 0 and hasattr(cv2, "CAP_PROP_ORIENTATION_META"):
+            try:
+                meta = float(cap.get(cv2.CAP_PROP_ORIENTATION_META) or 0.0)
+                if abs(meta) >= 1.0:
+                    meta_deg = int(round(meta)) % 360
+                    if meta_deg in (90, 180, 270):
+                        rotation_deg = meta_deg
+            except Exception:
+                pass
         ok, frame = cap.read()
         if not ok or frame is None:
             return None
+        frame = _rotate_frame_bgr(frame, rotation_deg)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         return Image.fromarray(rgb)
     finally:

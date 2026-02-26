@@ -1022,6 +1022,15 @@ class GrowingUpPipeline:
             cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 0)
 
         rotation_deg = self._read_video_rotation_degrees(video_path)
+        if rotation_deg == 0 and hasattr(cv2, "CAP_PROP_ORIENTATION_META"):
+            try:
+                meta = float(cap.get(cv2.CAP_PROP_ORIENTATION_META) or 0.0)
+                if abs(meta) >= 1.0:
+                    meta_deg = int(round(meta)) % 360
+                    if meta_deg in (90, 180, 270):
+                        rotation_deg = meta_deg
+            except Exception:
+                pass
 
         src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
         if src_fps <= 0.1:
@@ -1121,15 +1130,14 @@ class GrowingUpPipeline:
     @staticmethod
     def _rotate_frame_bgr(frame: np.ndarray, rotation_deg: int) -> np.ndarray:
         if rotation_deg == 90:
-            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
         if rotation_deg == 180:
             return cv2.rotate(frame, cv2.ROTATE_180)
         if rotation_deg == 270:
-            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
         return frame
 
-    @staticmethod
-    def _apply_caption_cv2(frame_bgr: np.ndarray, text: str) -> np.ndarray:
+    def _apply_caption_cv2(self, frame_bgr: np.ndarray, text: str) -> np.ndarray:
         """
         Overlay text caption at the bottom of the frame using OpenCV only.
 
@@ -1138,34 +1146,67 @@ class GrowingUpPipeline:
         if not text:
             return frame_bgr
         h, w = frame_bgr.shape[:2]
+        rgba = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA)
+        base = Image.fromarray(rgba)
+        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
 
-        font = cv2.FONT_HERSHEY_DUPLEX
-        font_scale = max(0.6, h / 1080.0)
-        thickness = max(1, int(font_scale * 2))
+        font_size = max(24, int(h / 24))
+        font = self._load_caption_font(font_size)
+        text_render = self._prepare_caption_text(text)
+        try:
+            bbox = draw.textbbox((0, 0), text_render, font=font)
+            tw = max(1, int(bbox[2] - bbox[0]))
+            th = max(1, int(bbox[3] - bbox[1]))
+        except Exception:
+            tw, th = draw.textsize(text_render, font=font)  # type: ignore[attr-defined]
+            tw = max(1, int(tw))
+            th = max(1, int(th))
 
-        # Measure text
-        (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-        tx = (w - tw) // 2
-        ty = h - max(30, h // 20)
-
-        # Semi-transparent background bar
-        bar_pad = 12
-        overlay = frame_bgr.copy()
-        cv2.rectangle(
-            overlay,
-            (tx - bar_pad, ty - th - bar_pad),
-            (tx + tw + bar_pad, ty + baseline + bar_pad),
-            (0, 0, 0),
-            cv2.FILLED,
+        tx = max(10, (w - tw) // 2)
+        ty = max(10, h - max(48, h // 14) - th)
+        pad_x = max(10, int(font_size * 0.35))
+        pad_y = max(8, int(font_size * 0.22))
+        draw.rectangle(
+            [(tx - pad_x, ty - pad_y), (tx + tw + pad_x, ty + th + pad_y)],
+            fill=(0, 0, 0, 150),
         )
-        result = cv2.addWeighted(frame_bgr, 0.5, overlay, 0.5, 0)
+        draw.text((tx, ty), text_render, font=font, fill=(255, 255, 255, 255))
 
-        # Draw text
-        cv2.putText(
-            result, text, (tx, ty),
-            font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA,
-        )
-        return result
+        composed = Image.alpha_composite(base, overlay).convert("RGB")
+        return cv2.cvtColor(np.array(composed), cv2.COLOR_RGB2BGR)
+
+    @staticmethod
+    def _prepare_caption_text(text: str) -> str:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return ""
+        try:
+            from bidi.algorithm import get_display  # type: ignore
+
+            return get_display(cleaned)
+        except Exception:
+            return cleaned
+
+    @staticmethod
+    def _load_caption_font(font_size: int) -> ImageFont.ImageFont:
+        candidates = [
+            os.environ.get("AIGUG_CAPTION_FONT"),
+            "C:/Windows/Fonts/arial.ttf",
+            "C:/Windows/Fonts/segoeui.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ]
+        for font_path in candidates:
+            if not font_path:
+                continue
+            try:
+                if Path(font_path).exists():
+                    return ImageFont.truetype(font_path, size=font_size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
 
     @staticmethod
     def _style_ease(t: float, style: str) -> float:
