@@ -31,6 +31,7 @@ class SessionState:
     resolution: str = "1080p"  # 720p / 1080p / 4K
     performance_mode: str = "balanced"  # includes extreme_* presets
     turbo_mode: bool = True
+    video_slow_motion_factor: float = 1.0
     music_path: Optional[str] = None
     fade_enabled: bool = True
 

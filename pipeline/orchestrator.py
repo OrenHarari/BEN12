@@ -724,6 +724,7 @@ class GrowingUpPipeline:
         captions: list[str] | None = None,
         fade_in_out: bool = True,
         music_path: str | None = None,
+        video_slow_motion_factor: float = 1.0,
         progress_callback: Callable[[float, str], None] | None = None,
     ) -> Path:
         """
@@ -805,6 +806,7 @@ class GrowingUpPipeline:
                     morph_h=morph_h,
                     target_fps=vc.fps_output,
                     max_seconds=float(getattr(cfg.pipeline, "max_video_clip_seconds", 12.0)),
+                    slow_motion_factor=float(max(1.0, video_slow_motion_factor)),
                 )
                 preview_rgb = cv2.cvtColor(frames[0], cv2.COLOR_BGR2RGB)
                 self.stage_previews.append((idx, Image.fromarray(preview_rgb).resize((128, 128), Image.LANCZOS)))
@@ -1010,6 +1012,7 @@ class GrowingUpPipeline:
         morph_h: int,
         target_fps: int,
         max_seconds: float,
+        slow_motion_factor: float = 1.0,
     ) -> list[np.ndarray]:
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -1045,7 +1048,7 @@ class GrowingUpPipeline:
             raise ValueError(f"Video has no readable frames: {video_path}")
 
         duration_sec = len(raw_frames) / max(src_fps, 1.0)
-        target_count = int(round(duration_sec * max(1, target_fps)))
+        target_count = int(round(duration_sec * max(1, target_fps) * max(1.0, slow_motion_factor)))
         target_count = max(1, min(target_count, int(max(1.0, max_seconds) * max(1, target_fps))))
         if target_count >= len(raw_frames):
             return raw_frames

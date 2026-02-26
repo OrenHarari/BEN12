@@ -250,6 +250,17 @@ def _sidebar(state):
         help="How many transitions each process computes per chunk.",
         disabled=state.is_processing or not state.chunked_parallel,
     )
+    state.video_slow_motion_factor = float(
+        st.sidebar.slider(
+            "Video Slow Motion",
+            min_value=1.0,
+            max_value=2.5,
+            value=float(state.video_slow_motion_factor),
+            step=0.1,
+            help="Applies only to uploaded video items in Timeline mode.",
+            disabled=state.is_processing,
+        )
+    )
 
     # Background music upload
     st.sidebar.divider()
@@ -364,6 +375,7 @@ def _run_pipeline(media_items, captions, config, state):
                 captions=captions,
                 fade_in_out=state.fade_enabled,
                 music_path=state.music_path,
+                video_slow_motion_factor=state.video_slow_motion_factor,
                 progress_callback=progress_cb,
             )
 
@@ -569,6 +581,8 @@ def main():
             c2.metric("Style", state.transition_style)
             c3.metric("Duration", f"{state.transition_duration_seconds:.2f}s")
             st.caption(f"Media mix: {num_images} image(s), {num_videos} video(s)")
+            if num_videos > 0 and state.video_slow_motion_factor > 1.0:
+                st.caption(f"Video slow motion: {state.video_slow_motion_factor:.1f}x")
             preset = PERFORMANCE_PRESETS[state.performance_mode]
             profile = compute_transition_plan(
                 transition_style=state.transition_style,
@@ -611,6 +625,8 @@ def main():
             extras.append("Fade In/Out")
         if state.music_path:
             extras.append("Music")
+        if num_videos > 0 and state.video_slow_motion_factor > 1.0:
+            extras.append(f"Video Slow {state.video_slow_motion_factor:.1f}x")
         if any(t for t in overlay_texts):
             extras.append("Text Overlay")
         if extras:
@@ -694,6 +710,7 @@ def main():
         saved_fade = state.fade_enabled
         saved_music = state.music_path
         saved_turbo = state.turbo_mode
+        saved_video_slow = state.video_slow_motion_factor
 
         reset_state()
         state = get_state()
@@ -714,6 +731,7 @@ def main():
         state.fade_enabled = saved_fade
         state.music_path = saved_music
         state.turbo_mode = saved_turbo
+        state.video_slow_motion_factor = saved_video_slow
 
         thread = threading.Thread(
             target=_run_pipeline,
