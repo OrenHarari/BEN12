@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import shutil
@@ -53,7 +54,7 @@ RESOLUTION_MAP = {
     "4K":    (3840, 2160),
 }
 MAX_UPLOAD_EDGE = 2048
-MAX_TIMELINE_ITEMS = 120
+MAX_TIMELINE_ITEMS = 400
 IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 VIDEO_EXTENSIONS = {"mp4", "mov", "m4v", "webm", "avi"}
 TRANSITION_STYLE_OPTIONS = ["Emotional", "Balanced", "Fast"]
@@ -64,10 +65,11 @@ PERFORMANCE_PRESETS = {
         "sdxl_steps": 18,
         "refiner_steps": 0,
         "rife_multiplier": 1,
-        "ffmpeg_preset": "fast",
+        "ffmpeg_preset": "veryfast",
         "ffmpeg_gpu_preset": "p4",
         "enable_gfpgan": False,
         "enable_refiner": False,
+        "use_fast_crossdissolve": False,
     },
     "balanced": {
         "sdxl_steps": 25,
@@ -77,6 +79,7 @@ PERFORMANCE_PRESETS = {
         "ffmpeg_gpu_preset": "p5",
         "enable_gfpgan": True,
         "enable_refiner": True,
+        "use_fast_crossdissolve": False,
     },
     "quality": {
         "sdxl_steps": 35,
@@ -86,15 +89,17 @@ PERFORMANCE_PRESETS = {
         "ffmpeg_gpu_preset": "p6",
         "enable_gfpgan": True,
         "enable_refiner": True,
+        "use_fast_crossdissolve": False,
     },
     "extreme_speed_3090": {
-        "sdxl_steps": 8,
+        "sdxl_steps": 6,
         "refiner_steps": 0,
         "rife_multiplier": 1,
-        "ffmpeg_preset": "fast",
+        "ffmpeg_preset": "ultrafast",
         "ffmpeg_gpu_preset": "p1",
         "enable_gfpgan": False,
         "enable_refiner": False,
+        "use_fast_crossdissolve": False,
     },
     "extreme_quality_3090": {
         "sdxl_steps": 24,
@@ -104,13 +109,14 @@ PERFORMANCE_PRESETS = {
         "ffmpeg_gpu_preset": "p5",
         "enable_gfpgan": True,
         "enable_refiner": True,
+        "use_fast_crossdissolve": False,
     },
 }
 PERFORMANCE_PRESET_ORDER = [
+    "extreme_speed_3090",
     "fast",
     "balanced",
     "quality",
-    "extreme_speed_3090",
     "extreme_quality_3090",
 ]
 
@@ -128,12 +134,16 @@ def _upload_ext(filename: str) -> str:
     return Path(filename).suffix.lower().lstrip(".")
 
 
-def _save_upload_to_temp(uploaded_file, suffix: str) -> str:
+def _save_bytes_to_temp(payload: bytes, suffix: str) -> str:
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    uploaded_file.seek(0)
-    tmp.write(uploaded_file.read())
+    tmp.write(payload)
     tmp.close()
     return tmp.name
+
+
+def _file_signature(file_name: str, payload: bytes) -> str:
+    digest = hashlib.sha1(payload).hexdigest()
+    return f"{file_name}:{digest}"
 
 
 def _resolve_ffprobe_binary() -> str | None:
@@ -410,6 +420,7 @@ def _run_pipeline(media_items, captions, config, state):
         config.pipeline.enable_chunked_parallel = bool(state.chunked_parallel)
         config.pipeline.transition_chunk_size = int(state.transition_chunk_size)
         config.video.rife_multiplier = preset["rife_multiplier"]
+        config.pipeline.use_fast_crossdissolve = preset.get("use_fast_crossdissolve", False)
         config.pipeline.transition_style = state.transition_style
         config.pipeline.transition_duration_seconds = state.transition_duration_seconds
         timing = compute_transition_plan(
@@ -500,58 +511,112 @@ def main():
         )
 
         if uploaded_files:
-            state.uploaded_media_items = []
-            state.uploaded_images = []
-            successful_loads = 0
+            limited_files = uploaded_files[:MAX_TIMELINE_ITEMS]
+            upload_token = "|".join(
+                f"{f.name}:{getattr(f, 'size', 0)}:{_upload_ext(f.name)}"
+                for f in limited_files
+            )
+            if upload_token != state.uploads_token:
+                prev_caps: dict[str, str] = {}
+                prev_texts: dict[str, str] = {}
+                prev_slow: dict[str, float] = {}
+                for i, item in enumerate(state.uploaded_media_items):
+                    sig = str(item.get("signature", ""))
+                    if not sig:
+                        continue
+                    if i < len(state.image_captions):
+                        prev_caps[sig] = state.image_captions[i]
+                    if i < len(state.image_text_overlays):
+                        prev_texts[sig] = state.image_text_overlays[i]
+                    if i < len(state.timeline_video_slow_factors):
+                        prev_slow[sig] = float(state.timeline_video_slow_factors[i])
 
-            for idx, uploaded_file in enumerate(uploaded_files[:MAX_TIMELINE_ITEMS]):
-                try:
-                    ext = _upload_ext(uploaded_file.name)
-                    if ext in IMAGE_EXTENSIONS:
-                        uploaded_file.seek(0)
-                        file_bytes = io.BytesIO(uploaded_file.read())
-                        image = ImageOps.exif_transpose(Image.open(file_bytes)).convert("RGB")
-                        w, h = image.size
-                        max_edge = max(w, h)
-                        if max_edge > MAX_UPLOAD_EDGE:
-                            scale = MAX_UPLOAD_EDGE / max_edge
-                            image = image.resize(
-                                (max(1, int(w * scale)), max(1, int(h * scale))),
-                                Image.LANCZOS,
+                new_items: list[dict] = []
+                new_captions: list[str] = []
+                new_texts: list[str] = []
+                new_slow_factors: list[float] = []
+                seen_signatures: set[str] = set()
+                successful_loads = 0
+                duplicate_count = 0
+
+                for idx, uploaded_file in enumerate(limited_files):
+                    try:
+                        ext = _upload_ext(uploaded_file.name)
+                        payload = uploaded_file.getvalue()
+                        sig = _file_signature(uploaded_file.name, payload)
+                        if sig in seen_signatures:
+                            duplicate_count += 1
+                            continue
+                        seen_signatures.add(sig)
+
+                        if ext in IMAGE_EXTENSIONS:
+                            image = ImageOps.exif_transpose(Image.open(io.BytesIO(payload))).convert("RGB")
+                            w, h = image.size
+                            max_edge = max(w, h)
+                            if max_edge > MAX_UPLOAD_EDGE:
+                                scale = MAX_UPLOAD_EDGE / max_edge
+                                image = image.resize(
+                                    (max(1, int(w * scale)), max(1, int(h * scale))),
+                                    Image.LANCZOS,
+                                )
+                            new_items.append(
+                                {
+                                    "kind": "image",
+                                    "image": image,
+                                    "name": uploaded_file.name,
+                                    "signature": sig,
+                                }
                             )
-                        state.uploaded_images.append(image)
-                        state.uploaded_media_items.append(
-                            {
-                                "kind": "image",
-                                "image": image,
-                                "name": uploaded_file.name,
-                            }
-                        )
-                    elif ext in VIDEO_EXTENSIONS:
-                        temp_path = _save_upload_to_temp(uploaded_file, suffix=f".{ext or 'mp4'}")
-                        thumb = _load_video_thumbnail(temp_path)
-                        if thumb is None:
-                            raise ValueError("Could not decode video")
-                        state.uploaded_media_items.append(
-                            {
-                                "kind": "video",
-                                "video_path": temp_path,
-                                "thumbnail": thumb,
-                                "name": uploaded_file.name,
-                            }
-                        )
-                    else:
-                        raise ValueError(f"Unsupported file type: {ext}")
-                    successful_loads += 1
-                except Exception as e:
-                    st.error(f"Could not load file {idx + 1} ({uploaded_file.name}): {e}")
+                            new_slow_factors.append(1.0)
+                        elif ext in VIDEO_EXTENSIONS:
+                            temp_path = _save_bytes_to_temp(payload, suffix=f".{ext or 'mp4'}")
+                            thumb = _load_video_thumbnail(temp_path)
+                            if thumb is None:
+                                raise ValueError("Could not decode video")
+                            new_items.append(
+                                {
+                                    "kind": "video",
+                                    "video_path": temp_path,
+                                    "thumbnail": thumb,
+                                    "name": uploaded_file.name,
+                                    "signature": sig,
+                                }
+                            )
+                            new_slow_factors.append(float(prev_slow.get(sig, 1.0)))
+                        else:
+                            raise ValueError(f"Unsupported file type: {ext}")
+
+                        new_captions.append(prev_caps.get(sig, ""))
+                        new_texts.append(prev_texts.get(sig, ""))
+                        successful_loads += 1
+                    except Exception as e:
+                        st.error(f"Could not load file {idx + 1} ({uploaded_file.name}): {e}")
+
+                state.uploaded_media_items = new_items
+                state.image_captions = new_captions
+                state.image_text_overlays = new_texts
+                state.timeline_video_slow_factors = new_slow_factors
+                state.uploaded_images = [
+                    item["image"] for item in state.uploaded_media_items if item["kind"] == "image"
+                ]
+                state.uploaded_image = next(
+                    (item["image"] for item in state.uploaded_media_items if item["kind"] == "image"),
+                    None,
+                )
+                state.uploads_token = upload_token
+                if state.uploaded_media_items:
+                    msg = f"Loaded {successful_loads} timeline item(s)"
+                    if duplicate_count > 0:
+                        msg += f" ({duplicate_count} duplicate file(s) skipped)"
+                    st.success(msg)
+            elif state.uploaded_media_items:
+                st.caption(f"Loaded {len(state.uploaded_media_items)} timeline item(s)")
 
             if state.uploaded_media_items:
                 state.uploaded_image = next(
                     (item["image"] for item in state.uploaded_media_items if item["kind"] == "image"),
                     None,
                 )
-                st.success(f"Loaded {successful_loads} timeline item(s)")
 
                 num = len(state.uploaded_media_items)
                 while len(state.image_captions) < num:
@@ -576,19 +641,21 @@ def main():
                 new_slow_factors = [1.0] * num
 
                 cols_per_row = min(num, 4)
+                remove_index = None
                 for row_start in range(0, num, cols_per_row):
                     row_end = min(row_start + cols_per_row, num)
                     cols = st.columns(cols_per_row)
                     for ci, i in enumerate(range(row_start, row_end)):
                         with cols[ci]:
                             item = state.uploaded_media_items[i]
+                            if st.button("X", key=f"remove_item_{i}", disabled=state.is_processing):
+                                remove_index = i
+                            st.caption(f"{item['kind'].capitalize()}: {item.get('name', '')}")
                             if item["kind"] == "image":
                                 st.image(item["image"], use_column_width=True)
-                                st.caption("Image")
                                 slow_factor = 1.0
                             else:
                                 st.image(item["thumbnail"], use_column_width=True)
-                                st.caption(f"Video: {item['name']}")
                                 slow_factor = float(
                                     st.slider(
                                         "Video Slow Motion",
@@ -627,6 +694,20 @@ def main():
                             new_captions[i] = cap
                             new_texts[i] = txt
                             new_slow_factors[i] = slow_factor
+
+                if remove_index is not None:
+                    state.uploaded_media_items.pop(remove_index)
+                    state.image_captions.pop(remove_index)
+                    state.image_text_overlays.pop(remove_index)
+                    state.timeline_video_slow_factors.pop(remove_index)
+                    state.uploaded_images = [
+                        item["image"] for item in state.uploaded_media_items if item["kind"] == "image"
+                    ]
+                    state.uploaded_image = next(
+                        (item["image"] for item in state.uploaded_media_items if item["kind"] == "image"),
+                        None,
+                    )
+                    _safe_rerun()
 
                 if len(set(new_order)) == num:
                     sorted_indices = sorted(range(num), key=lambda x: new_order[x])
@@ -878,18 +959,63 @@ def main():
         st.subheader("Preview")
         st.video(state.output_path)
 
+        video_size_bytes = os.path.getsize(state.output_path)
+        video_size_mb = video_size_bytes / (1024 * 1024)
+
         with open(state.output_path, "rb") as f:
             video_bytes = f.read()
 
         res_label = state.resolution
         st.download_button(
-            label=f"Download MP4 ({res_label})",
+            label=f"Download MP4 ({res_label}) — {video_size_mb:.0f} MB",
             data=video_bytes,
             file_name="growing_up.mp4",
             mime="video/mp4",
             type="primary",
             use_container_width=True,
+            key="auto_download_btn",
         )
+        del video_bytes
+
+        # --- Auto-click the download button via JS (works for any file size) ---
+        import streamlit.components.v1 as components
+        auto_click_js = """
+        <script>
+        (function() {
+            function clickDownload() {
+                // Find the Streamlit download button by its key or by type=primary
+                var buttons = window.parent.document.querySelectorAll(
+                    'button[kind="primary"], button[data-testid="stDownloadButton"], button.st-emotion-cache-1ny7cjd'
+                );
+                for (var i = 0; i < buttons.length; i++) {
+                    var btn = buttons[i];
+                    if (btn.innerText && btn.innerText.indexOf('Download MP4') !== -1) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                // Fallback: try any primary button with Download text
+                var allBtns = window.parent.document.querySelectorAll('button');
+                for (var j = 0; j < allBtns.length; j++) {
+                    if (allBtns[j].innerText && allBtns[j].innerText.indexOf('Download MP4') !== -1) {
+                        allBtns[j].click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+            // Retry a few times — button may not be rendered yet
+            var attempts = 0;
+            var interval = setInterval(function() {
+                attempts++;
+                if (clickDownload() || attempts > 15) {
+                    clearInterval(interval);
+                }
+            }, 500);
+        })();
+        </script>
+        """
+        components.html(auto_click_js, height=0, width=0)
 
         if state.preview_frames:
             st.subheader("Stage Previews")

@@ -2,13 +2,23 @@
 
 **Last Updated:** February 25, 2026  
 **Branch:** `claude/ai-growing-up-video-t1aZ8`  
-**Status:** ✅ **FULLY OPERATIONAL**
+**Status:** ✅ **FULLY OPERATIONAL (Streamlit)** + 🆕 **AI Growing Up Generator (FastAPI + Gradio) IMPLEMENTED**
 
 ---
 
 ## ✅ Latest Update (February 25, 2026)
 
 ### Implemented now
+
+- Added new root launcher `python main.py` for local multi-process startup
+- Added `services/` layer with:
+  - FastAPI backend (`submit`, `status`, `download`, plus `cancel` + `retry`)
+  - Gradio Web UI with required controls and progress polling
+  - SQLite local job queue (`pending`, `running`, `completed`, `failed`)
+  - Dedicated sequential GPU worker process
+  - Full Movie builder from user-defined scene list with transitions
+- Added optional runtime hooks for ControlNet and Stable Video Diffusion model loading (env-flag enabled)
+- Kept existing Streamlit pipeline intact for backward compatibility
 
 - Transition control upgraded from `slow/normal/fast` to a numeric slider `1..10`
 - New mapping logic: `1 = slowest` transitions (more frames), `10 = fastest` (fewer frames)

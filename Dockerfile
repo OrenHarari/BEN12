@@ -1,13 +1,15 @@
 # syntax=docker/dockerfile:1
-FROM nvidia/cuda:12.4.1-cudnn9-runtime-ubuntu22.04
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 \
-    python3.11-dev \
+    python3.10 \
+    python3.10-dev \
     python3-pip \
-    python3.11-venv \
+    python3.10-venv \
+    g++ \
+    fonts-dejavu-core \
     ffmpeg \
     libgl1-mesa-glx \
     libglib2.0-0 \
@@ -21,14 +23,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
-    ln -sf /usr/bin/python3.11 /usr/bin/python
+RUN ln -sf /usr/bin/python3.10 /usr/bin/python3 && \
+    ln -sf /usr/bin/python3.10 /usr/bin/python
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 \
+    pip install --no-cache-dir torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
         --index-url https://download.pytorch.org/whl/cu124 && \
     pip install --no-cache-dir -r requirements.txt
 
@@ -51,5 +53,5 @@ ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 ENV INSIGHTFACE_HOME=/app/weights
 
 CMD ["streamlit", "run", "app/main.py", \
-     "--server.maxUploadSize=50", \
-     "--server.enableCORS=false"]
+    "--server.maxUploadSize=50", \
+    "--server.enableCORS=false"]

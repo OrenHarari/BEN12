@@ -1,7 +1,7 @@
 # Core ML
-torch==2.3.1
-torchvision==0.18.1
-torchaudio==2.3.1
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
 
 # Diffusers / HuggingFace
 diffusers==0.29.2
@@ -9,7 +9,6 @@ transformers==4.41.2
 accelerate==0.30.0
 safetensors==0.4.3
 huggingface-hub==0.23.2
-xformers==0.0.27
 
 # IP-Adapter (install from source)
 ip-adapter @ git+https://github.com/tencent-ailab/IP-Adapter.git
@@ -32,8 +31,13 @@ scipy==1.13.1
 
 # UI
 streamlit==1.35.0
+gradio==4.44.1
+fastapi==0.115.8
+uvicorn==0.34.0
+python-multipart==0.0.20
 
 # Utilities
 requests==2.32.3
 tqdm==4.66.4
 imageio-ffmpeg==0.6.0
+python-bidi==0.4.2

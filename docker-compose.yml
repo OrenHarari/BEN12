@@ -1,24 +1,23 @@
-version: "3.9"
-
 services:
   growing-up:
     build: .
-    runtime: nvidia
+    gpus: all
+    cpus: "${AIGUG_CPUS:-12}"
+    mem_limit: "${AIGUG_MEM_LIMIT:-28g}"
+    mem_reservation: "${AIGUG_MEM_RESERVATION:-16g}"
+    shm_size: "${AIGUG_SHM_SIZE:-12gb}"
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - BEN12_INSIGHTFACE_PROVIDER=cuda
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-12}
+      - OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-12}
+      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-12}
+      - NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS:-12}
     ports:
       - "8501:8501"
     volumes:
       - ./weights:/app/weights
       - ./outputs:/app/outputs
       - ./tmp:/app/tmp
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     restart: unless-stopped
-    shm_size: "8gb"

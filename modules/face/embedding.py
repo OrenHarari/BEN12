@@ -17,7 +17,10 @@ class IdentityEmbedder:
         if not faces:
             raise ValueError("No face found for embedding extraction.")
         face = max(faces, key=lambda f: f.det_score)
-        return face.normed_embedding.astype(np.float32)
+        embedding = getattr(face, "normed_embedding", None)
+        if embedding is None:
+            raise ValueError("Face embedding is unavailable for the detected face.")
+        return embedding.astype(np.float32)
 
     @staticmethod
     def cosine_similarity(emb1: np.ndarray, emb2: np.ndarray) -> float:

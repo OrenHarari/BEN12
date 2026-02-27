@@ -20,16 +20,17 @@ class SessionState:
     error_message: Optional[str] = None
     preview_frames: list = field(default_factory=list)
     stage_timings: dict = field(default_factory=dict)
+    uploads_token: str = ""
     # New feature settings
     image_captions: list[str] = field(default_factory=list)
     image_text_overlays: list[str] = field(default_factory=list)
     transition_style: str = "Balanced"  # Emotional / Balanced / Fast
-    transition_duration_seconds: float = 2.5
-    transition_process_workers: int = 4
+    transition_duration_seconds: float = 1.5
+    transition_process_workers: int = 12
     chunked_parallel: bool = True
-    transition_chunk_size: int = 4
-    resolution: str = "1080p"  # 720p / 1080p / 4K
-    performance_mode: str = "fast"  # includes extreme_* presets
+    transition_chunk_size: int = 6
+    resolution: str = "720p"  # 720p / 1080p / 4K
+    performance_mode: str = "extreme_speed_3090"  # includes extreme_* presets
     turbo_mode: bool = True
     timeline_video_slow_factors: list[float] = field(default_factory=list)
     music_path: Optional[str] = None

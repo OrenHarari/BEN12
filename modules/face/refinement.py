@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import numpy as np
+import sys
+import types
 import torch
 
 
@@ -11,6 +13,15 @@ class FaceRefiner:
     """
 
     def __init__(self, weights_path: str, device: torch.device, upscale: int = 1):
+        try:
+            import torchvision.transforms.functional_tensor  # noqa: F401
+        except ModuleNotFoundError:
+            from torchvision.transforms import _functional_tensor as functional_tensor
+
+            shim = types.ModuleType("torchvision.transforms.functional_tensor")
+            shim.__dict__.update(functional_tensor.__dict__)
+            sys.modules["torchvision.transforms.functional_tensor"] = shim
+
         from gfpgan import GFPGANer
 
         self.restorer = GFPGANer(

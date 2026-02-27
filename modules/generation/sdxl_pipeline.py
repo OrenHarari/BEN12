@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import gc
+import logging
 
 import torch
 from PIL import Image
 
 from modules.generation.prompt_builder import PromptBuilder
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgeProgressionPipeline:
@@ -65,7 +69,10 @@ class AgeProgressionPipeline:
             algorithm_type="sde-dpmsolver++",
             use_karras_sigmas=True,
         )
-        self._base_pipe.enable_xformers_memory_efficient_attention()
+        try:
+            self._base_pipe.enable_xformers_memory_efficient_attention()
+        except Exception as exc:
+            logger.warning("xformers not enabled for SDXL base: %s", exc)
         self._base_pipe.enable_vae_slicing()
         self._base_pipe.enable_vae_tiling()
         self._base_pipe = self._base_pipe.to(self.device)
@@ -86,7 +93,10 @@ class AgeProgressionPipeline:
             variant="fp16",
             use_safetensors=True,
         )
-        self._refiner_pipe.enable_xformers_memory_efficient_attention()
+        try:
+            self._refiner_pipe.enable_xformers_memory_efficient_attention()
+        except Exception as exc:
+            logger.warning("xformers not enabled for SDXL refiner: %s", exc)
         self._refiner_pipe = self._refiner_pipe.to(self.device)
 
     def generate_age_stage(

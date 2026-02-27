@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from time import perf_counter
@@ -126,6 +127,11 @@ class GrowingUpPipeline:
         self.cpu_workers = max(2, min(12, self._available_cpu_count()))
         self.last_stage_timings: dict[str, float] = {}
         self._rtl_direction_supported: bool | None = None
+        self._caption_overlay_cache: OrderedDict[
+            tuple[int, int, str, int, int],
+            tuple[int, int, np.ndarray, np.ndarray],
+        ] = OrderedDict()
+        self._caption_cache_max_entries = 32
         cv2.setUseOptimized(True)
         cv2.setNumThreads(max(1, min(8, self.cpu_workers)))
 
@@ -258,22 +264,25 @@ class GrowingUpPipeline:
             smoothing_window=int(single_plan["smoothing_window"]),
         )
 
+        use_fast_crossdissolve_single = getattr(pc, 'use_fast_crossdissolve', False)
+
         for i in range(n_trans):
             img_src = np.array(refined_images[i].resize((out_w, out_h), Image.LANCZOS))
             img_dst = np.array(refined_images[i + 1].resize((out_w, out_h), Image.LANCZOS))
             img_src_bgr = cv2.cvtColor(img_src, cv2.COLOR_RGB2BGR)
             img_dst_bgr = cv2.cvtColor(img_dst, cv2.COLOR_RGB2BGR)
 
-            pts_src = all_landmarks[i]
-            pts_dst = all_landmarks[i + 1]
-
-            triangles = morpher.compute_triangulation(pts_src, pts_dst, (out_h, out_w))
-
             for f in range(pc.frames_per_transition):
                 alpha = alpha_schedule_single[f]
-                frame = warper.morph_frame(
-                    img_src_bgr, img_dst_bgr, pts_src, pts_dst, triangles, alpha
-                )
+                if use_fast_crossdissolve_single:
+                    frame = cv2.addWeighted(img_src_bgr, 1.0 - alpha, img_dst_bgr, alpha, 0)
+                else:
+                    pts_src = all_landmarks[i]
+                    pts_dst = all_landmarks[i + 1]
+                    triangles = morpher.compute_triangulation(pts_src, pts_dst, (out_h, out_w))
+                    frame = warper.morph_frame(
+                        img_src_bgr, img_dst_bgr, pts_src, pts_dst, triangles, alpha
+                    )
                 morph_keyframes.append(frame)
 
             p_frac = 0.50 + 0.15 * ((i + 1) / n_trans)
@@ -434,13 +443,13 @@ class GrowingUpPipeline:
         n_trans = n_images - 1
         rife_weights = cfg.rife_weights_path
         rife_mult = vc.rife_multiplier if vc.rife_multiplier > 1 else 1
-        transition_out_frames = (
-            int(profile["transition_output_frames"]) if rife_weights.exists() and rife_mult > 1
-            else keyframes_per_transition
-        )
+        transition_out_frames = int(profile["transition_output_frames"])
 
         total_output_frames = hold_count
         total_output_frames += n_trans * (transition_out_frames + hold_count)
+        stage_times["total_output_frames"] = float(total_output_frames)
+        stage_times["keyframes_per_transition"] = float(keyframes_per_transition)
+        stage_times["hold_frames"] = float(hold_count)
 
         kb = KenBurnsEffect(output_size=(morph_w, morph_h))
         fade_frames = min(int(profile["fade_frames"]), hold_count) if fade_in_out else 0
@@ -487,6 +496,9 @@ class GrowingUpPipeline:
         t_morph_total = 0.0
         t_rife_total = 0.0
         t_encode = perf_counter()
+
+        # Fast crossdissolve mode: skip Delaunay entirely, use cv2.addWeighted
+        use_fast_crossdissolve = getattr(cfg.pipeline, 'use_fast_crossdissolve', False)
 
         try:
             cpu_budget = self._available_cpu_count()
@@ -598,7 +610,16 @@ class GrowingUpPipeline:
                 both_have_faces = face_detected[i] and face_detected[i + 1]
                 frames_this: list[np.ndarray] = []
 
-                if use_process_pool and process_pool is not None:
+                # ── Fast crossdissolve: skip expensive Delaunay warp entirely ──
+                if use_fast_crossdissolve:
+                    t0 = perf_counter()
+                    for fidx in range(keyframes_per_transition):
+                        alpha = alpha_schedule[fidx]
+                        frames_this.append(
+                            cv2.addWeighted(src, 1.0 - alpha, dst, alpha, 0)
+                        )
+                    t_morph_total += perf_counter() - t0
+                elif use_process_pool and process_pool is not None:
                     if chunked_parallel:
                         chunk_start = (i // chunk_size) * chunk_size
                         if chunk_start not in chunk_results:
@@ -698,6 +719,7 @@ class GrowingUpPipeline:
                     t_rife_total += perf_counter() - t0
                 else:
                     interp_frames = frames_this
+                interp_frames = self._resample_frames(interp_frames, transition_out_frames)
 
                 for fi, frame in enumerate(interp_frames):
                     alpha = fi / max(len(interp_frames) - 1, 1)
@@ -707,7 +729,8 @@ class GrowingUpPipeline:
                 _write_hold(dst, dst_caption, hold_count)
 
                 report(0.55 + 0.35 * ((i + 1) / n_trans), f"Encoding transition {i + 1}/{n_trans}...")
-                _free_memory()
+                if rife is not None and (i + 1) % 12 == 0:
+                    _free_memory()
 
         finally:
             if 'process_pool' in locals() and process_pool is not None:
@@ -877,10 +900,7 @@ class GrowingUpPipeline:
         n_trans = max(0, len(prepared) - 1)
         rife_weights = cfg.rife_weights_path
         rife_mult = vc.rife_multiplier if vc.rife_multiplier > 1 else 1
-        transition_out_frames = (
-            int(profile["transition_output_frames"]) if rife_weights.exists() and rife_mult > 1
-            else keyframes_per_transition
-        )
+        transition_out_frames = int(profile["transition_output_frames"])
 
         total_output_frames = 0
         for i, item in enumerate(prepared):
@@ -995,6 +1015,7 @@ class GrowingUpPipeline:
                     t_rife_total += perf_counter() - t0
                 else:
                     frames_out = keyframes
+                frames_out = self._resample_frames(frames_out, transition_out_frames)
 
                 for fi, frame in enumerate(frames_out):
                     alpha = fi / max(1, len(frames_out) - 1)
@@ -1004,7 +1025,8 @@ class GrowingUpPipeline:
                 _write_item_body(dst, cap_list[i + 1], skip_first_video_frame=True)
 
                 report(0.20 + 0.70 * ((i + 1) / max(1, n_trans)), f"Rendered transition {i + 1}/{n_trans}...")
-                _free_memory()
+                if rife is not None and (i + 1) % 12 == 0:
+                    _free_memory()
 
         finally:
             if rife is not None:
@@ -1098,6 +1120,34 @@ class GrowingUpPipeline:
         idxs = np.linspace(0, len(raw_frames) - 1, num=target_count).round().astype(np.int32)
         return [raw_frames[int(i)] for i in idxs]
 
+    @staticmethod
+    def _resample_frames(frames: list[np.ndarray], target_count: int) -> list[np.ndarray]:
+        """Resample frame list to target_count using linear blending (not nearest-neighbor)."""
+        if not frames:
+            return frames
+        target = max(1, int(target_count))
+        n = len(frames)
+        if n == target:
+            return frames
+        if n == 1:
+            return [frames[0]] * target
+        result: list[np.ndarray] = []
+        for i in range(target):
+            t = i * (n - 1) / (target - 1) if target > 1 else 0.0
+            lo = int(t)
+            hi = min(lo + 1, n - 1)
+            frac = t - lo
+            if frac < 1e-6:
+                result.append(frames[lo])
+            elif frac > 1.0 - 1e-6:
+                result.append(frames[hi])
+            else:
+                blended = cv2.addWeighted(
+                    frames[lo], 1.0 - frac, frames[hi], frac, 0
+                )
+                result.append(blended)
+        return result
+
     def _read_video_rotation_degrees(self, video_path: Path) -> int:
         """
         Return normalized rotation in {0, 90, 180, 270} from video metadata.
@@ -1172,22 +1222,67 @@ class GrowingUpPipeline:
 
     def _apply_caption_cv2(self, frame_bgr: np.ndarray, text: str) -> np.ndarray:
         """
-        Overlay text caption at the bottom with PIL font rendering.
+        Overlay text caption at the bottom.
 
-        No PIL conversion round-trip — about 10× faster than the PIL path.
+        Caption glyph rendering is cached and reused across frames, which is
+        critical for large albums where the same caption appears on many frames.
         """
         if not text:
             return frame_bgr
         h, w = frame_bgr.shape[:2]
-        rgba = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA)
-        base = Image.fromarray(rgba)
-        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-
         font_size = max(24, int(h / 24))
+        overlay_entry = self._get_caption_overlay_cached(
+            frame_h=h,
+            frame_w=w,
+            text=text,
+            font_size=font_size,
+        )
+        if overlay_entry is None:
+            return frame_bgr
+
+        x1, y1, overlay_bgr_f, overlay_alpha = overlay_entry
+        if float(np.max(overlay_alpha)) <= 1e-6:
+            return frame_bgr
+
+        h_roi, w_roi = overlay_alpha.shape[:2]
+        y2 = min(frame_bgr.shape[0], y1 + h_roi)
+        x2 = min(frame_bgr.shape[1], x1 + w_roi)
+        if y2 <= y1 or x2 <= x1:
+            return frame_bgr
+
+        out = frame_bgr.copy()
+        roi = out[y1:y2, x1:x2].astype(np.float32)
+        alpha = overlay_alpha[: y2 - y1, : x2 - x1]
+        fg = overlay_bgr_f[: y2 - y1, : x2 - x1]
+        roi *= (1.0 - alpha)
+        roi += fg * alpha
+        out[y1:y2, x1:x2] = np.clip(roi, 0, 255).astype(np.uint8)
+        return out
+
+    def _get_caption_overlay_cached(
+        self,
+        frame_h: int,
+        frame_w: int,
+        text: str,
+        font_size: int,
+    ) -> tuple[int, int, np.ndarray, np.ndarray] | None:
+        cleaned = self._prepare_caption_text(text)
+        if not cleaned:
+            return None
+
+        cache_key_base = (int(frame_h), int(frame_w), cleaned, int(font_size))
+        for direction_flag in (0, 1):
+            cache_key = (*cache_key_base, direction_flag)
+            cached = self._caption_overlay_cache.get(cache_key)
+            if cached is not None:
+                self._caption_overlay_cache.move_to_end(cache_key)
+                return cached
+
+        overlay = Image.new("RGBA", (frame_w, frame_h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
         font = self._load_caption_font(font_size)
-        rtl_direction_supported = self._is_rtl_text(text) and self._rtl_direction_is_supported(draw, font)
-        text_render = self._prepare_caption_text_for_render(text, use_rtl_direction=rtl_direction_supported)
+        rtl_direction_supported = self._is_rtl_text(cleaned) and self._rtl_direction_is_supported(draw, font)
+        text_render = self._prepare_caption_text_for_render(cleaned, use_rtl_direction=rtl_direction_supported)
         text_kwargs: dict = {}
         if rtl_direction_supported:
             text_kwargs["direction"] = "rtl"
@@ -1216,11 +1311,11 @@ class GrowingUpPipeline:
                         th = max(1, int(th))
                     except Exception:
                         tw = max(1, int(draw.textlength(text_render, font=font)))
-                        th = max(1, int(getattr(font, "size", max(24, int(h / 24)))))
+                        th = max(1, int(getattr(font, "size", max(24, int(frame_h / 24)))))
                     text_kwargs = {}
 
-        tx = max(10, (w - tw) // 2)
-        ty = max(10, h - max(48, h // 14) - th)
+        tx = max(10, (frame_w - tw) // 2)
+        ty = max(10, frame_h - max(48, frame_h // 14) - th)
         pad_x = max(10, int(font_size * 0.35))
         pad_y = max(8, int(font_size * 0.22))
         draw.rectangle(
@@ -1232,8 +1327,23 @@ class GrowingUpPipeline:
         except Exception:
             draw.text((tx, ty), text_render, font=font, fill=(255, 255, 255, 255))
 
-        composed = Image.alpha_composite(base, overlay).convert("RGB")
-        return cv2.cvtColor(np.array(composed), cv2.COLOR_RGB2BGR)
+        overlay_rgba = np.array(overlay, dtype=np.uint8)
+        alpha2d = overlay_rgba[:, :, 3]
+        ys, xs = np.where(alpha2d > 0)
+        if ys.size == 0 or xs.size == 0:
+            return None
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        overlay_roi = overlay_rgba[y1:y2, x1:x2]
+        overlay_alpha = (overlay_roi[:, :, 3:4].astype(np.float32) / 255.0)
+        overlay_bgr_f = overlay_roi[:, :, :3][:, :, ::-1].astype(np.float32)
+
+        cache_key = (*cache_key_base, 1 if rtl_direction_supported else 0)
+        self._caption_overlay_cache[cache_key] = (x1, y1, overlay_bgr_f, overlay_alpha)
+        self._caption_overlay_cache.move_to_end(cache_key)
+        while len(self._caption_overlay_cache) > self._caption_cache_max_entries:
+            self._caption_overlay_cache.popitem(last=False)
+        return self._caption_overlay_cache[cache_key]
 
     @staticmethod
     def _prepare_caption_text(text: str) -> str:
