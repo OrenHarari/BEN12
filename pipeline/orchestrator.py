@@ -1122,7 +1122,13 @@ class GrowingUpPipeline:
 
     @staticmethod
     def _resample_frames(frames: list[np.ndarray], target_count: int) -> list[np.ndarray]:
-        """Resample frame list to target_count using linear blending (not nearest-neighbor)."""
+        """Resample frame list to target_count.
+
+        Uses snap-to-nearest when the fractional position is close to an
+        existing frame (< 0.15) to avoid unnecessary blending that causes
+        a soft/ghosted look.  Only blends when truly between two source
+        frames.
+        """
         if not frames:
             return frames
         target = max(1, int(target_count))
@@ -1132,14 +1138,15 @@ class GrowingUpPipeline:
         if n == 1:
             return [frames[0]] * target
         result: list[np.ndarray] = []
+        snap_threshold = 0.15  # snap to nearest instead of blending
         for i in range(target):
             t = i * (n - 1) / (target - 1) if target > 1 else 0.0
             lo = int(t)
             hi = min(lo + 1, n - 1)
             frac = t - lo
-            if frac < 1e-6:
+            if frac < snap_threshold:
                 result.append(frames[lo])
-            elif frac > 1.0 - 1e-6:
+            elif frac > 1.0 - snap_threshold:
                 result.append(frames[hi])
             else:
                 blended = cv2.addWeighted(

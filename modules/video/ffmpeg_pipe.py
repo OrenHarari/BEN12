@@ -28,7 +28,8 @@ def _video_encode_args(codec: str, preset: str, quality: int) -> list[str]:
             "-c:v", "h264_nvenc",
             "-preset", preset,
             "-cq", str(quality),
-            "-b:v", "0",
+            "-maxrate", "15M",
+            "-bufsize", "30M",
         ]
     return [
         "-c:v", codec,

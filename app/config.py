@@ -29,7 +29,7 @@ class VideoConfig:
     ken_burns_zoom_max: float = 1.08
     ken_burns_pan_x: float = 0.02
     ken_burns_pan_y: float = 0.01
-    crf: int = 18
+    crf: int = 23
     codec: str = "libx264"
     preset: str = "p1"
     pixel_format: str = "yuv420p"
@@ -140,38 +140,32 @@ def compute_transition_plan(
     duration_sec = max(0.2, min(12.0, float(transition_duration_seconds)))
     hold_scale = 1.0
     fade_scale = 1.0
-    keyframes_cap: int | None = None
 
     if turbo_mode:
         if n >= 100:
-            morph_h = 480
-            hold_scale = 0.45
-            fade_scale = 0.50
-            keyframes_cap = 30
-        elif n >= 70:
             morph_h = 512
-            hold_scale = 0.50
-            fade_scale = 0.60
-            keyframes_cap = 35
-        elif n >= 40:
-            morph_h = 576
             hold_scale = 0.55
-            fade_scale = 0.65
-            keyframes_cap = 40
-        elif n >= 25:
+            fade_scale = 0.50
+        elif n >= 70:
+            morph_h = 576
+            hold_scale = 0.60
+            fade_scale = 0.60
+        elif n >= 40:
             morph_h = 640
             hold_scale = 0.65
+            fade_scale = 0.65
+        elif n >= 25:
+            morph_h = 640
+            hold_scale = 0.70
             fade_scale = 0.70
-            keyframes_cap = 45
         else:
             morph_h = 640
     else:
         morph_h = 768
 
     transition_output_frames = max(2, int(round(duration_sec * fps)))
+    # keyframes = transition_output_frames / rife — eliminates resampling artifacts
     keyframes = max(2, int(round((transition_output_frames - 1) / rife)) + 1)
-    if keyframes_cap is not None:
-        keyframes = min(keyframes, keyframes_cap)
 
     if output_height > 0:
         morph_h = min(morph_h, int(output_height))
@@ -179,8 +173,8 @@ def compute_transition_plan(
     morph_w = int(morph_h * output_width / max(1, output_height))
     morph_w = max(320, (morph_w // 32) * 32)
 
-    hold_frames = max(5, int(round(transition_output_frames * params["hold_ratio"] * hold_scale)))
-    fade_frames = max(3, int(round(transition_output_frames * params["fade_ratio"] * fade_scale)))
+    hold_frames = max(15, int(round(transition_output_frames * params["hold_ratio"] * hold_scale)))
+    fade_frames = max(4, int(round(transition_output_frames * params["fade_ratio"] * fade_scale)))
 
     return {
         "style": style,
