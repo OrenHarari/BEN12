@@ -356,6 +356,7 @@ class GrowingUpPipeline:
         captions: list[str] | None = None,
         fade_in_out: bool = True,
         music_path: str | None = None,
+        music_paths: list[str] | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
     ) -> Path:
         """
@@ -502,7 +503,7 @@ class GrowingUpPipeline:
 
         try:
             cpu_budget = self._available_cpu_count()
-            max_process_workers = max(1, min(12, cpu_budget))
+            max_process_workers = max(1, min(cpu_budget, 64))
             process_workers = max(
                 1,
                 min(int(cfg.pipeline.transition_process_workers), max_process_workers, max(1, n_trans)),
@@ -743,13 +744,17 @@ class GrowingUpPipeline:
         stage_times["rife_total"] = t_rife_total
         stage_times["encode_pipe"] = perf_counter() - t_encode
 
-        if music_path:
+        # --- mux audio (multi-track or single) ---
+        _audio_list = [Path(p) for p in (music_paths or []) if p]
+        if not _audio_list and music_path:
+            _audio_list = [Path(music_path)]
+        if _audio_list:
             t_mux = perf_counter()
             report(0.93, "Adding background music...")
             renderer = VideoRenderer(cfg)
             renderer.mux_audio(
                 video_path=output_path,
-                audio_path=Path(music_path),
+                audio_paths=_audio_list,
             )
             stage_times["mux_audio"] = perf_counter() - t_mux
 
@@ -765,6 +770,7 @@ class GrowingUpPipeline:
         captions: list[str] | None = None,
         fade_in_out: bool = True,
         music_path: str | None = None,
+        music_paths: list[str] | None = None,
         video_slow_motion_factor: float = 1.0,
         progress_callback: Callable[[float, str], None] | None = None,
     ) -> Path:
@@ -1038,13 +1044,17 @@ class GrowingUpPipeline:
         stage_times["rife_total"] = t_rife_total
         stage_times["encode_pipe"] = perf_counter() - t_encode
 
-        if music_path:
+        # --- mux audio (multi-track or single) ---
+        _audio_list = [Path(p) for p in (music_paths or []) if p]
+        if not _audio_list and music_path:
+            _audio_list = [Path(music_path)]
+        if _audio_list:
             t_mux = perf_counter()
             report(0.93, "Adding background music...")
             renderer = VideoRenderer(cfg)
             renderer.mux_audio(
                 video_path=output_path,
-                audio_path=Path(music_path),
+                audio_paths=_audio_list,
             )
             stage_times["mux_audio"] = perf_counter() - t_mux
 

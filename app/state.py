@@ -34,6 +34,7 @@ class SessionState:
     turbo_mode: bool = True
     timeline_video_slow_factors: list[float] = field(default_factory=list)
     music_path: Optional[str] = None
+    music_paths: list[str] = field(default_factory=list)  # up to 3 music files
     fade_enabled: bool = True
 
 

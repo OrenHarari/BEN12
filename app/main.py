@@ -331,7 +331,7 @@ def _sidebar(state):
         disabled=state.is_processing,
     )
     cpu_budget = _available_cpu_count()
-    max_worker_ui = max(1, min(16, cpu_budget))
+    max_worker_ui = max(1, min(64, cpu_budget))
     worker_value = max(1, min(int(state.transition_process_workers), max_worker_ui))
     state.transition_process_workers = st.sidebar.slider(
         "Transition Workers (Processes)",
@@ -350,29 +350,38 @@ def _sidebar(state):
     state.transition_chunk_size = st.sidebar.slider(
         "Chunk Size (transitions)",
         min_value=1,
-        max_value=12,
-        value=max(1, min(int(state.transition_chunk_size), 12)),
+        max_value=24,
+        value=max(1, min(int(state.transition_chunk_size), 24)),
         help="How many transitions each process computes per chunk.",
         disabled=state.is_processing or not state.chunked_parallel,
     )
-    # Background music upload
+    # Background music upload (up to 3 tracks: beginning, middle, end)
     st.sidebar.divider()
     st.sidebar.subheader("Background Music")
-    music_file = st.sidebar.file_uploader(
-        "Upload MP3 (optional)",
-        type=["mp3", "wav", "m4a", "ogg"],
-        help="Audio will be added as background music, trimmed to video length",
-        disabled=state.is_processing,
-    )
-    if music_file is not None:
-        music_bytes = music_file.read()
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        tmp.write(music_bytes)
-        tmp.close()
-        state.music_path = tmp.name
-        st.sidebar.success(music_file.name)
-    elif not music_file:
-        state.music_path = None
+    _music_labels = [
+        ("🎵 Track 1 — Beginning", "music_begin"),
+        ("🎵 Track 2 — Middle", "music_middle"),
+        ("🎵 Track 3 — End", "music_end"),
+    ]
+    new_music_paths: list[str] = []
+    for label, key in _music_labels:
+        mf = st.sidebar.file_uploader(
+            label,
+            type=["mp3", "wav", "m4a", "ogg"],
+            help="Optional — tracks are concatenated in order",
+            disabled=state.is_processing,
+            key=key,
+        )
+        if mf is not None:
+            music_bytes = mf.read()
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+            tmp.write(music_bytes)
+            tmp.close()
+            new_music_paths.append(tmp.name)
+            st.sidebar.caption(f"✓ {mf.name}")
+    state.music_paths = new_music_paths
+    # Backward compat: set music_path to first track if any
+    state.music_path = new_music_paths[0] if new_music_paths else None
 
     st.sidebar.divider()
     show_system = st.sidebar.checkbox(
@@ -461,6 +470,7 @@ def _run_pipeline(media_items, captions, config, state):
                 captions=captions,
                 fade_in_out=state.fade_enabled,
                 music_path=state.music_path,
+                music_paths=state.music_paths,
                 progress_callback=progress_cb,
             )
         else:
@@ -469,6 +479,7 @@ def _run_pipeline(media_items, captions, config, state):
                 captions=captions,
                 fade_in_out=state.fade_enabled,
                 music_path=state.music_path,
+                music_paths=state.music_paths,
                 progress_callback=progress_cb,
             )
 
@@ -817,7 +828,9 @@ def main():
         extras = []
         if state.fade_enabled:
             extras.append("Fade In/Out")
-        if state.music_path:
+        if state.music_paths:
+            extras.append(f"Music ({len(state.music_paths)} track{'s' if len(state.music_paths) > 1 else ''})")
+        elif state.music_path:
             extras.append("Music")
         if slow_videos:
             extras.append(f"Video Slow x{max(slow_videos):.1f}")
@@ -909,6 +922,7 @@ def main():
         saved_chunk_size = state.transition_chunk_size
         saved_fade = state.fade_enabled
         saved_music = state.music_path
+        saved_music_paths = list(state.music_paths)
         saved_turbo = state.turbo_mode
         saved_video_slow_factors = list(state.timeline_video_slow_factors)
 
@@ -930,6 +944,7 @@ def main():
         state.transition_chunk_size = saved_chunk_size
         state.fade_enabled = saved_fade
         state.music_path = saved_music
+        state.music_paths = saved_music_paths
         state.turbo_mode = saved_turbo
         state.timeline_video_slow_factors = saved_video_slow_factors
 
